@@ -378,12 +378,17 @@ def fetch_google_trends(keyword: str) -> dict:
     반환: { trend_score, trend_direction, source }
 
     [ 주니어 개발자에게 ]
-    과도한 요청 시 429 에러. 키워드 사이 sleep(1.2) 필수.
+    pytrends는 비공식 API → IP 기반 rate limit(429)이 걸릴 수 있어요.
+    세션은 모듈 레벨에서 한 번만 생성해 재사용하고, 호출 횟수도 제한해야 해요.
     한국 기준(geo='KR')으로 조회해도 네이버 트렌드와 다를 수 있어요.
     """
     try:
         from pytrends.request import TrendReq
-        pytrends = TrendReq(hl="ko", tz=540, timeout=(10, 25))
+        # 세션 재사용: 전역 캐시에 없으면 생성, 있으면 재사용
+        if not hasattr(fetch_google_trends, "_pytrends"):
+            fetch_google_trends._pytrends = TrendReq(hl="ko", tz=540, timeout=(10, 25),
+                                                      retries=1, backoff_factor=1.5)
+        pytrends = fetch_google_trends._pytrends
         pytrends.build_payload([keyword], timeframe="today 3-m", geo="KR")
         df = pytrends.interest_over_time()
 
@@ -1270,12 +1275,19 @@ def analyze_seed(seed: str, top_n: int = 5) -> list:
     enriched.sort(key=lambda x: x["_mid"], reverse=True)
     top_final = enriched[:top_n]
 
-    # ── Step 4: Google Trends (상위 top_n만) ─────────────────
-    print(f"\n  【 Step 4 】 Google Trends 조회 (상위 {top_n}개)...")
+    # ── Step 4: Google Trends (상위 3개만, rate limit 방지) ──
+    # pytrends는 비공식 API → 429 방지를 위해 최대 3개까지만 호출
+    # 나머지는 중간값(0) 처리 → gtrends 가중치가 10점이라 영향 미미
+    GT_SEED_LIMIT = 3
+    print(f"\n  【 Step 4 】 Google Trends 조회 (상위 {GT_SEED_LIMIT}개, 나머지 스킵)...")
     for i, c in enumerate(top_final):
-        print(f"    [{i+1}/{top_n}] {c['keyword']}")
-        c["_gt"] = fetch_google_trends(c["keyword"])
-        time.sleep(2.0)   # 429 방지: 넉넉하게 대기
+        if i < GT_SEED_LIMIT:
+            print(f"    [{i+1}/{top_n}] {c['keyword']}")
+            c["_gt"] = fetch_google_trends(c["keyword"])
+            time.sleep(3.0)   # 429 방지: 세션 재사용해도 여유 있게 대기
+        else:
+            print(f"    [{i+1}/{top_n}] {c['keyword']}  (GT 스킵 — rate limit 방지)")
+            c["_gt"] = {"trend_score": 0, "trend_direction": "스킵(rate limit 방지)", "source": "skipped"}
 
     # ── Step 5: 최종 점수 계산 ──────────────────────────────
     print(f"\n  【 Step 5 】 최종 점수 계산 및 랭킹...")
