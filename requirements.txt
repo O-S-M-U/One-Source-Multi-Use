@@ -1,0 +1,16 @@
+# Core (필수)
+python-dateutil>=2.8.2
+
+# Local xlsx 백엔드
+openpyxl>=3.1.0
+
+# Google Sheets 실연동 (선택)
+gspread>=6.0.0
+google-auth>=2.27.0
+
+# 환경변수 로딩 (선택)
+python-dotenv>=1.0.0
+
+# 네이버 API / pytrends (선택 — naver_golden 평가기용)
+requests>=2.31.0
+pytrends>=4.9.0

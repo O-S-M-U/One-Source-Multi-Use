@@ -1,0 +1,26 @@
+{
+  "name": "OSMU Keyword Researcher",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "onCreateCommand": "bash .devcontainer/on-create.sh",
+  "updateContentCommand": "pip install -e . --no-deps",
+  "postStartCommand": "bash .devcontainer/post-start.sh",
+  "forwardPorts": [8501, 8000],
+  "portsAttributes": {
+    "8501": {"label": "OSMU Streamlit UI", "onAutoForward": "openPreview"}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python", "ms-python.vscode-pylance",
+        "charliermarsh.ruff", "redhat.vscode-yaml"
+      ],
+      "settings": {"python.defaultInterpreterPath": "/usr/local/bin/python"}
+    }
+  },
+  "remoteEnv": {
+    "PYTHONPATH": "${containerWorkspaceFolder}/src:${containerWorkspaceFolder}/ui"
+  }
+}

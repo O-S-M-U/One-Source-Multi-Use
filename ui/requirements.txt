@@ -1,0 +1,13 @@
+# GUI (Streamlit) 전용 의존성
+streamlit>=1.32
+pandas>=2.0
+watchdog>=3.0; sys_platform != "win32"
+
+# 본체 의존성도 같이
+python-dateutil>=2.8.2
+openpyxl>=3.1.0
+gspread>=6.0.0
+google-auth>=2.27.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+pytrends>=4.9.0

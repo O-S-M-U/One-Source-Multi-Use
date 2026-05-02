@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osmu-kr"
+version = "0.2.0"
+description = "O.S.M.U Keyword Researcher — seed 기반 황금 키워드 라이프사이클 관리 모듈"
+authors = [{name = "OSMU Team"}]
+requires-python = ">=3.10"
+dependencies = [
+  "python-dateutil>=2.8.2",
+  "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+sheets = ["gspread>=6.0.0", "google-auth>=2.27.0"]
+naver = ["requests>=2.31.0", "pytrends>=4.9.0"]
+dotenv = ["python-dotenv>=1.0.0"]
+
+[project.scripts]
+osmu-kr = "osmu_kr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
