@@ -1,0 +1,47 @@
+======================================================================
+시연 시나리오 ②  POOL_MAX_SIZE / REVIVAL_DAYS 관리
+======================================================================
+
+config: backend=local evaluator=heuristic POOL_MAX_SIZE=5 REVIVAL_DAYS=0.1 SEED_COOLDOWN_DAYS=0.1 GOLDEN=65.0 MEDIUM=[45.0,65.0]
+
+[1] 두 seed 실행 → 풀이 자동으로 POOL_MAX_SIZE=5로 정리되는지 확인
+   - run_seed('다이어트') → seed='다이어트' expanded=10 accepted=9 transmuted=3 rejected=0
+   - run_seed('AI ETF') → seed='AI ETF' expanded=10 accepted=9 transmuted=2 rejected=0
+   - run_seed('챗GPT 활용법') → seed='챗GPT 활용법' expanded=10 accepted=9 transmuted=3 rejected=0
+   ▶ 현재 pool 크기 = 5 (기대: ≤5)
+
+   현재 pool:
+     · 0013 '직장인 AI ETF 순위 비교' score=89.11 updated_at=2026-05-01T12:28:31+0000
+     · 0004 '다이어트 추천' score=86.22 updated_at=2026-05-01T12:28:31+0000
+     · 0017 '직장인 챗GPT 활용법 방법 추천' score=86.22 updated_at=2026-05-01T12:28:31+0000
+     · 0025 '챗GPT 활용법 TOP5' score=86.22 updated_at=2026-05-01T12:28:31+0000
+     · 0012 '직장인 AI ETF 순위 추천' score=86.0 updated_at=2026-05-01T12:28:31+0000
+
+[2] 모든 풀 항목의 updated_at을 0.2일 과거로 만든 뒤 prune() 호출
+   ▶ prune 결과: revaluated=5 refreshed=5 expired=0 transmuted=0 overflow_removed=0
+   ▶ prune 후 pool 크기 = 5
+   prune 후 pool:
+     · 0013 '직장인 AI ETF 순위 비교' score=89.11 status=golden updated_at=2026-05-01T12:28:31+0000
+     · 0004 '다이어트 추천' score=86.22 status=golden updated_at=2026-05-01T12:28:31+0000
+     · 0017 '직장인 챗GPT 활용법 방법 추천' score=86.22 status=golden updated_at=2026-05-01T12:28:31+0000
+     · 0025 '챗GPT 활용법 TOP5' score=86.22 status=golden updated_at=2026-05-01T12:28:31+0000
+     · 0012 '직장인 AI ETF 순위 추천' score=86.0 status=golden updated_at=2026-05-01T12:28:31+0000
+
+[2-b] 의도적으로 점수가 낮은 키워드를 풀에 끼워 넣고 prune → 삭제(expire) 확인
+   ▶ prune 결과: revaluated=6 refreshed=6 expired=0 transmuted=0 overflow_removed=1
+   ▶ '9999' 만료 처리 결과: EXPIRED ✅
+
+[3] 동일 seed 기반 콘텐츠 간격 제어 검증
+    (a) 추천된 키워드를 select_for_content() → content_db 기록
+    선택: 0013 '직장인 AI ETF 순위 비교' seed='AI ETF'
+    (b) 동일 seed의 다른 키워드를 즉시 선택 시도 (차단 기대)
+    ✅ 차단됨 (예상대로): seed_cooldown 위반: 'AI ETF' 는 최근 0.1일 내에 사용됨
+
+   recommend()도 동일 seed를 후보에서 제외하는지 확인:
+     - 추천 후보 seed: ['다이어트', '챗GPT 활용법']
+     - 차단된 seed='AI ETF'가 위 목록에 없는지 확인 → OK
+
+   content_db 현재 상태:
+     · id=001 keyword='직장인 AI ETF 순위 비교' seed='AI ETF' status=대기중
+
+로컬 데이터 위치: /sessions/optimistic-charming-keller/mnt/outputs/osmu_keyword_researcher/data/scenario_2

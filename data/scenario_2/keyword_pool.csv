@@ -1,0 +1,6 @@
+keyword_id,seed_keyword,keyword,search_volume,competition,cpc,commercial_intent,score,status,created_at,updated_at,source,note
+0030,AI ETF,직장인 AI ETF 순위 비교,20076,낮음,1560.0,0.7,89.11,golden,2026-05-01T12:28:31+0000,2026-05-01T12:28:31+0000,heuristic+alchemy,transmuted from 'AI ETF 순위'
+0004,다이어트,다이어트 추천,5775,낮음,1750.0,0.45,86.22,golden,2026-05-01T07:40:31+0000,2026-05-01T12:28:31+0000,heuristic,re-evaluated:golden | re-evaluated:golden
+0017,챗GPT 활용법,직장인 챗GPT 활용법 방법 추천,18503,낮음,1300.0,0.7,86.22,golden,2026-05-01T07:40:31+0000,2026-05-01T12:28:31+0000,heuristic+alchemy,transmuted from '챗GPT 활용법 방법' | re-evaluated:golden | re-evaluated:golden
+0025,챗GPT 활용법,챗GPT 활용법 TOP5,8135,낮음,1750.0,0.45,86.22,golden,2026-05-01T07:40:31+0000,2026-05-01T12:28:31+0000,heuristic,re-evaluated:golden | re-evaluated:golden
+0012,AI ETF,직장인 AI ETF 순위 추천,19032,낮음,710.0,0.7,86.0,golden,2026-05-01T07:40:31+0000,2026-05-01T12:28:31+0000,heuristic+alchemy,transmuted from 'AI ETF 순위' | re-evaluated:golden | re-evaluated:golden

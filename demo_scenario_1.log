@@ -1,0 +1,102 @@
+======================================================================
+시연 시나리오 ①  seed → 후보 → 평가 → pool 저장 (+ 연금술)
+======================================================================
+
+config: backend=local evaluator=heuristic POOL_MAX_SIZE=50 REVIVAL_DAYS=14.0 SEED_COOLDOWN_DAYS=7.0 GOLDEN=65.0 MEDIUM=[45.0,65.0]
+
+────────────────────────────────────────────────────────────
+▶ run_seed('다이어트')
+   seed='다이어트' expanded=10 accepted=9 transmuted=3 rejected=0
+   · 0001 '직장인 다이어트 추천' [score=81.0 sv=16618 comp=낮음 cpc=780.0] (연금술)
+   · 0002 '직장인 다이어트 방법' [score=81.0 sv=15503 comp=낮음 cpc=960.0] (연금술)
+   · 0003 '직장인 다이어트 비교' [score=81.51 sv=33172 comp=낮음 cpc=1540.0] (연금술)
+   · 0004 '다이어트 추천' [score=86.22 sv=5775 comp=낮음 cpc=1750.0] 
+   · 0005 '다이어트 비교' [score=84.67 sv=23002 comp=낮음 cpc=1610.0] 
+   · 0006 '다이어트 방법' [score=66.33 sv=22047 comp=중간 cpc=1310.0] 
+   · 0007 '다이어트 순위' [score=83.11 sv=9720 comp=낮음 cpc=1470.0] 
+   · 0008 '다이어트 후기' [score=69.0 sv=25171 comp=중간 cpc=1550.0] 
+   · 0009 '다이어트 가격' [score=81.0 sv=23868 comp=낮음 cpc=1200.0] 
+   · 0010 '다이어트 리뷰' [score=81.0 sv=20062 comp=낮음 cpc=770.0] 
+   · 0011 '다이어트 best' [score=66.0 sv=26605 comp=중간 cpc=1040.0] 
+   · 0012 '다이어트 TOP5' [score=73.89 sv=20497 comp=중간 cpc=1990.0] 
+
+────────────────────────────────────────────────────────────
+▶ run_seed('AI ETF')
+   seed='AI ETF' expanded=10 accepted=9 transmuted=2 rejected=0
+   · 0013 'AI ETF' [score=67.33 sv=25836 comp=중간 cpc=1850.0] 
+   · 0014 'AI ETF 추천' [score=81.44 sv=10594 comp=낮음 cpc=1320.0] 
+   · 0015 'AI ETF 비교' [score=66.0 sv=7202 comp=중간 cpc=570.0] 
+   · 0016 'AI ETF 방법' [score=72.67 sv=4085 comp=중간 cpc=1880.0] 
+   · 0017 '직장인 AI ETF 순위 추천' [score=86.0 sv=19032 comp=낮음 cpc=710.0] (연금술)
+   · 0018 '직장인 AI ETF 순위 비교' [score=89.11 sv=20076 comp=낮음 cpc=1560.0] (연금술)
+   · 0019 'AI ETF 후기' [score=66.78 sv=24067 comp=중간 cpc=1350.0] 
+   · 0020 'AI ETF 가격' [score=81.0 sv=19295 comp=낮음 cpc=630.0] 
+   · 0021 'AI ETF 리뷰' [score=70.89 sv=26207 comp=중간 cpc=1720.0] 
+   · 0022 'AI ETF best' [score=68.89 sv=29492 comp=중간 cpc=1540.0] 
+   · 0023 'AI ETF TOP5' [score=71.22 sv=27505 comp=낮음 cpc=400.0] 
+
+────────────────────────────────────────────────────────────
+▶ run_seed('챗GPT 활용법')
+   seed='챗GPT 활용법' expanded=10 accepted=9 transmuted=3 rejected=0
+   · 0024 '챗GPT 활용법' [score=76.0 sv=18102 comp=낮음 cpc=680.0] 
+   · 0025 '챗GPT 활용법 추천' [score=84.89 sv=26397 comp=낮음 cpc=1630.0] 
+   · 0026 '챗GPT 활용법 비교' [score=71.67 sv=25239 comp=중간 cpc=1790.0] 
+   · 0027 '직장인 챗GPT 활용법 방법 추천' [score=86.22 sv=18503 comp=낮음 cpc=1300.0] (연금술)
+   · 0028 '직장인 챗GPT 활용법 방법 방법' [score=68.44 sv=18382 comp=중간 cpc=1500.0] (연금술)
+   · 0029 '직장인 챗GPT 활용법 방법 비교' [score=71.0 sv=20933 comp=중간 cpc=1220.0] (연금술)
+   · 0030 '챗GPT 활용법 순위' [score=70.22 sv=18578 comp=낮음 cpc=310.0] 
+   · 0031 '챗GPT 활용법 후기' [score=81.0 sv=19521 comp=낮음 cpc=710.0] 
+   · 0032 '챗GPT 활용법 가격' [score=81.56 sv=8160 comp=낮음 cpc=1330.0] 
+   · 0033 '챗GPT 활용법 리뷰' [score=66.54 sv=30462 comp=중간 cpc=1360.0] 
+   · 0034 '챗GPT 활용법 best' [score=70.0 sv=18134 comp=낮음 cpc=290.0] 
+   · 0035 '챗GPT 활용법 TOP5' [score=86.22 sv=8135 comp=낮음 cpc=1750.0] 
+
+======================================================================
+최종 keyword_pool
+======================================================================
+  ★ 0018 seed='AI ETF' '직장인 AI ETF 순위 비교' score=89.11 sv= 20076 comp=낮음 cpc=1560.0 status=golden source=heuristic+alchemy
+  ★ 0004 seed='다이어트' '다이어트 추천' score=86.22 sv=  5775 comp=낮음 cpc=1750.0 status=golden source=heuristic
+  ★ 0027 seed='챗GPT 활용법' '직장인 챗GPT 활용법 방법 추천' score=86.22 sv= 18503 comp=낮음 cpc=1300.0 status=golden source=heuristic+alchemy
+  ★ 0035 seed='챗GPT 활용법' '챗GPT 활용법 TOP5' score=86.22 sv=  8135 comp=낮음 cpc=1750.0 status=golden source=heuristic
+  ★ 0017 seed='AI ETF' '직장인 AI ETF 순위 추천' score= 86.0 sv= 19032 comp=낮음 cpc=710.0 status=golden source=heuristic+alchemy
+  ★ 0025 seed='챗GPT 활용법' '챗GPT 활용법 추천' score=84.89 sv= 26397 comp=낮음 cpc=1630.0 status=golden source=heuristic
+  ★ 0005 seed='다이어트' '다이어트 비교' score=84.67 sv= 23002 comp=낮음 cpc=1610.0 status=golden source=heuristic
+  ★ 0007 seed='다이어트' '다이어트 순위' score=83.11 sv=  9720 comp=낮음 cpc=1470.0 status=golden source=heuristic
+  ★ 0032 seed='챗GPT 활용법' '챗GPT 활용법 가격' score=81.56 sv=  8160 comp=낮음 cpc=1330.0 status=golden source=heuristic
+  ★ 0003 seed='다이어트' '직장인 다이어트 비교' score=81.51 sv= 33172 comp=낮음 cpc=1540.0 status=golden source=heuristic+alchemy
+  ★ 0014 seed='AI ETF' 'AI ETF 추천' score=81.44 sv= 10594 comp=낮음 cpc=1320.0 status=golden source=heuristic
+  ★ 0001 seed='다이어트' '직장인 다이어트 추천' score= 81.0 sv= 16618 comp=낮음 cpc=780.0 status=golden source=heuristic+alchemy
+  ★ 0002 seed='다이어트' '직장인 다이어트 방법' score= 81.0 sv= 15503 comp=낮음 cpc=960.0 status=golden source=heuristic+alchemy
+  ★ 0009 seed='다이어트' '다이어트 가격' score= 81.0 sv= 23868 comp=낮음 cpc=1200.0 status=golden source=heuristic
+  ★ 0010 seed='다이어트' '다이어트 리뷰' score= 81.0 sv= 20062 comp=낮음 cpc=770.0 status=golden source=heuristic
+  ★ 0020 seed='AI ETF' 'AI ETF 가격' score= 81.0 sv= 19295 comp=낮음 cpc=630.0 status=golden source=heuristic
+  ★ 0031 seed='챗GPT 활용법' '챗GPT 활용법 후기' score= 81.0 sv= 19521 comp=낮음 cpc=710.0 status=golden source=heuristic
+  ★ 0024 seed='챗GPT 활용법' '챗GPT 활용법' score= 76.0 sv= 18102 comp=낮음 cpc=680.0 status=golden source=heuristic
+  ★ 0012 seed='다이어트' '다이어트 TOP5' score=73.89 sv= 20497 comp=중간 cpc=1990.0 status=golden source=heuristic
+  ★ 0016 seed='AI ETF' 'AI ETF 방법' score=72.67 sv=  4085 comp=중간 cpc=1880.0 status=golden source=heuristic
+  ★ 0026 seed='챗GPT 활용법' '챗GPT 활용법 비교' score=71.67 sv= 25239 comp=중간 cpc=1790.0 status=golden source=heuristic
+  ★ 0023 seed='AI ETF' 'AI ETF TOP5' score=71.22 sv= 27505 comp=낮음 cpc=400.0 status=golden source=heuristic
+  ★ 0029 seed='챗GPT 활용법' '직장인 챗GPT 활용법 방법 비교' score= 71.0 sv= 20933 comp=중간 cpc=1220.0 status=golden source=heuristic+alchemy
+  ★ 0021 seed='AI ETF' 'AI ETF 리뷰' score=70.89 sv= 26207 comp=중간 cpc=1720.0 status=golden source=heuristic
+  ★ 0030 seed='챗GPT 활용법' '챗GPT 활용법 순위' score=70.22 sv= 18578 comp=낮음 cpc=310.0 status=golden source=heuristic
+  ★ 0034 seed='챗GPT 활용법' '챗GPT 활용법 best' score= 70.0 sv= 18134 comp=낮음 cpc=290.0 status=golden source=heuristic
+  ★ 0008 seed='다이어트' '다이어트 후기' score= 69.0 sv= 25171 comp=중간 cpc=1550.0 status=golden source=heuristic
+  ★ 0022 seed='AI ETF' 'AI ETF best' score=68.89 sv= 29492 comp=중간 cpc=1540.0 status=golden source=heuristic
+  ★ 0028 seed='챗GPT 활용법' '직장인 챗GPT 활용법 방법 방법' score=68.44 sv= 18382 comp=중간 cpc=1500.0 status=golden source=heuristic+alchemy
+  ★ 0013 seed='AI ETF' 'AI ETF' score=67.33 sv= 25836 comp=중간 cpc=1850.0 status=golden source=heuristic
+  ★ 0019 seed='AI ETF' 'AI ETF 후기' score=66.78 sv= 24067 comp=중간 cpc=1350.0 status=golden source=heuristic
+  ★ 0033 seed='챗GPT 활용법' '챗GPT 활용법 리뷰' score=66.54 sv= 30462 comp=중간 cpc=1360.0 status=golden source=heuristic
+  ★ 0006 seed='다이어트' '다이어트 방법' score=66.33 sv= 22047 comp=중간 cpc=1310.0 status=golden source=heuristic
+  ★ 0011 seed='다이어트' '다이어트 best' score= 66.0 sv= 26605 comp=중간 cpc=1040.0 status=golden source=heuristic
+  ★ 0015 seed='AI ETF' 'AI ETF 비교' score= 66.0 sv=  7202 comp=중간 cpc=570.0 status=golden source=heuristic
+
+[recommend top 5]
+  ★ 0018 '직장인 AI ETF 순위 비교' (score=89.11, seed='AI ETF')
+  ★ 0004 '다이어트 추천' (score=86.22, seed='다이어트')
+  ★ 0027 '직장인 챗GPT 활용법 방법 추천' (score=86.22, seed='챗GPT 활용법')
+  ★ 0035 '챗GPT 활용법 TOP5' (score=86.22, seed='챗GPT 활용법')
+  ★ 0017 '직장인 AI ETF 순위 추천' (score=86.0, seed='AI ETF')
+
+로컬 데이터 위치: /sessions/optimistic-charming-keller/mnt/outputs/osmu_keyword_researcher/data/scenario_1
+  - keyword_pool.csv
+  - content_db.csv  (이번 단계에선 비어 있음)
