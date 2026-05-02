@@ -201,6 +201,292 @@ def test_manage_full_pipeline():
     assert hasattr(report.prune, "revaluated")
 
 
+def test_keyword_translator_korean_to_english_and_slug():
+    from osmu_kr.content_generator.keyword_translator import (
+        translate_to_english_queries, keyword_to_slug, make_filename,
+    )
+    qs = translate_to_english_queries("직장인 다이어트 식단", max_queries=3)
+    assert qs, "후보 비어 있으면 안 됨"
+    joined = " ".join(qs).lower()
+    assert "diet" in joined and "meal" in joined
+
+    slug = keyword_to_slug("직장인 다이어트 식단")
+    assert slug == "office-diet-meal"
+
+    slug2 = keyword_to_slug("AI ETF 추천 2025")
+    assert "ai" in slug2 and "etf" in slug2
+
+    fn = make_filename(slug, 1, "jpg")
+    assert fn == "office-diet-meal-1.jpg"
+
+
+def test_picsum_image_provider_returns_image_items():
+    """폴백은 항상 동작 + ImageItem 형태 + 파일명 규칙."""
+    from osmu_kr.content_generator.images import PicsumImageProvider
+    from osmu_kr.content_generator.interfaces import ImageItem
+    p = PicsumImageProvider()
+    items = p.search("직장인 다이어트 식단", count=3)
+    assert len(items) == 3
+    for i, it in enumerate(items, 1):
+        assert isinstance(it, ImageItem)
+        assert it.url.startswith("https://picsum.photos/")
+        assert it.filename == f"office-diet-meal-{i}.jpg"
+        assert "직장인 다이어트 식단" in it.alt
+        assert it.source == "picsum"
+
+
+def test_chained_image_provider_dedup_and_renumber():
+    """ChainedImageProvider 가 다중 Provider 결과를 합치고 파일명 일관 적용."""
+    from osmu_kr.content_generator.images import (
+        ChainedImageProvider, PicsumImageProvider,
+    )
+    chain = ChainedImageProvider([PicsumImageProvider(), PicsumImageProvider()])
+    items = chain.search("AI ETF 추천", count=3)
+    assert len(items) == 3
+    # 파일명이 인덱스 1,2,3 순서로 매겨졌는지
+    for i, it in enumerate(items, 1):
+        assert it.filename.endswith(f"-{i}.jpg")
+
+
+def test_heuristic_writer_produces_html_with_images():
+    """LLM 자격증명 없을 때 폴백 writer 가 H1/H2/이미지 포함 HTML 생성 + ImageItem 처리."""
+    from osmu_kr.content_generator.writer import HeuristicWriter
+    from osmu_kr.content_generator.interfaces import ImageItem
+    w = HeuristicWriter()
+    images = [
+        ImageItem(url="https://example/1.jpg", filename="diet-1.jpg",
+                  alt="다이어트 추천 관련 이미지 1", source="test"),
+        ImageItem(url="https://example/2.jpg", filename="diet-2.jpg",
+                  alt="다이어트 추천 관련 이미지 2", source="test"),
+    ]
+    html = w.write("다이어트 추천",
+                    "다이어트는 식단 조절과 운동을 병행해야 합니다. "
+                    "단기간에 살을 빼려면 칼로리 적자가 필수입니다.",
+                    sources=["https://example.com/a"],
+                    images=images)
+    assert "<h1>" in html.lower()
+    assert "<h2>" in html.lower()
+    assert html.count("<img") >= 2
+    # data-filename 속성 포함
+    assert 'data-filename="diet-1.jpg"' in html
+    # alt 텍스트도 포함
+    assert "다이어트 추천 관련 이미지" in html
+
+
+def test_html_validation_detects_missing_images():
+    from osmu_kr.content_generator.writer import validate_html_structure
+    bad = "<h1>제목</h1><h2>본문</h2><p>글</p>"
+    issues = validate_html_structure(bad, expected_image_count=2)
+    assert any(i.startswith("insufficient_images") for i in issues)
+
+    good = ('<h1>x</h1><h2>y</h2><p>z</p>'
+            '<img src="https://a/1.jpg" alt="a 1"/>'
+            '<img src="https://a/2.jpg" alt="a 2"/>')
+    assert validate_html_structure(good, expected_image_count=2) == []
+
+
+def test_repair_missing_images_appends_when_writer_skips():
+    from osmu_kr.content_generator.writer import repair_missing_images
+    from osmu_kr.content_generator.interfaces import ImageItem
+    html_no_img = "<h1>x</h1><h2>섹션1</h2><p>본문</p><h2>섹션2</h2><p>본문</p>"
+    images = [
+        ImageItem(url="https://a/1.jpg", filename="a-1.jpg", alt="a 1"),
+        ImageItem(url="https://a/2.jpg", filename="a-2.jpg", alt="a 2"),
+    ]
+    fixed = repair_missing_images(html_no_img, images)
+    assert fixed.count("<img") >= 2
+
+
+def test_collector_with_stub_crawler():
+    """Crawler 스텁 → Collector 가 raw_content 합성."""
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, query, *, limit=5):
+            return [f"https://x.com/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(
+                url=url, title=f"제목 {url[-1]}",
+                content=("이 글은 다이어트에 대한 내용입니다. "
+                         "단기간 다이어트는 추천하지 않습니다. "
+                         "꾸준한 식단 관리가 핵심입니다."),
+            )
+
+    c = Collector(StubCrawler(), min_sources=3)
+    raw = c.collect("다이어트", limit=3)
+    assert raw.char_count > 0
+    assert len(raw.sources) == 3
+    # dedup 으로 동일 문장 3번 들어가지 않음
+    assert raw.text.count("이 글은 다이어트에 대한 내용입니다") == 1
+
+
+def test_generator_full_pipeline_with_stubs():
+    """모든 의존성 stub → Generator 전체 흐름 + ImageItem + JSON image_urls 검증."""
+    import json as _json
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseWriter, BaseImageProvider, CrawledPage, ImageItem,
+    )
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, query, *, limit=5):
+            return [f"https://news.example/{query}/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(
+                url=url, title="기사 제목",
+                content=(
+                    f"이 기사는 {url} 에서 가져온 본문입니다. "
+                    "다이어트와 관련된 다양한 정보를 정리한 글입니다. "
+                    "단기간 다이어트보다 꾸준한 식단 관리가 더 효과적입니다."
+                ),
+            )
+
+    class StubWriter(BaseWriter):
+        name = "stub_writer"
+        def write(self, keyword, raw_content, *, sources=None, images=None, tone="전문적"):
+            tags = "".join(
+                f'<img src="{im.url}" alt="{im.alt}" data-filename="{im.filename}"/>'
+                for im in (images or [])
+            )
+            return (f"<h1>{keyword}</h1><h2>본문</h2><p>{raw_content[:80]}</p>{tags}"
+                    f"<h2>마무리</h2><p>요약</p>")
+
+    class StubImages(BaseImageProvider):
+        name = "stub_images"
+        def search(self, query, *, count=3, slug="", alt_keyword=""):
+            return [
+                ImageItem(
+                    url=f"https://img.example/{i}.jpg",
+                    filename=f"{slug or 'image'}-{i}.jpg",
+                    alt=f"{alt_keyword or query} 관련 이미지 {i}",
+                    source="stub",
+                ) for i in range(1, count + 1)
+            ]
+
+    tmp = tempfile.mkdtemp(prefix="osmu_gen_")
+    storage = LocalCsvStorage(data_dir=tmp)
+    gen = Generator(
+        storage=storage,
+        crawler=StubCrawler(),
+        writer=StubWriter(),
+        images=StubImages(),
+        config=GeneratorConfig(n_sources=3, n_images=3),
+    )
+    result = gen.generate("직장인 다이어트 식단")
+    assert result.status == "generated"
+    assert "<h1>" in result.refined_post
+    assert result.refined_post.count("<img") >= 2
+    assert len(result.original_source) == 3
+    assert len(result.image_urls) == 3
+    # 파일명 규칙 — slug-N.jpg
+    for i, im in enumerate(result.image_urls, 1):
+        assert im.filename == f"office-diet-meal-{i}.jpg"
+
+    # content_db 의 image_urls 가 JSON 으로 직렬화됐는지
+    saved = next(r for r in storage.list_content() if r.id == result.record_id)
+    assert saved.status == "generated"
+    parsed = _json.loads(saved.image_urls)
+    assert isinstance(parsed, list) and len(parsed) == 3
+    assert parsed[0]["filename"] == "office-diet-meal-1.jpg"
+    assert parsed[0]["url"].startswith("https://img.example/")
+
+
+def test_generator_firecrawl_fallback_to_template():
+    """Crawler 가 빈 결과만 줄 때 → 폴백 텍스트로 진행."""
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseWriter, BaseImageProvider, CrawledPage,
+    )
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+
+    class EmptyCrawler(BaseCrawler):
+        name = "empty"
+        def search(self, query, *, limit=5):
+            return []
+        def scrape(self, url):
+            return CrawledPage(url=url, error="not_called")
+
+    class StubWriter(BaseWriter):
+        name = "stub_writer"
+        def write(self, keyword, raw_content, *, sources=None, images=None, tone="전문적"):
+            assert "외부 검색이 일시적으로" in raw_content, "폴백 텍스트가 전달돼야 함"
+            tags = "".join(
+                f'<img src="{im.url}" alt="{im.alt}" data-filename="{im.filename}"/>'
+                for im in (images or [])
+            )
+            return f"<h1>{keyword}</h1><h2>요약</h2><p>{raw_content}</p>{tags}"
+
+    class StubImages(BaseImageProvider):
+        name = "stub_images"
+        def search(self, query, *, count=3, slug="", alt_keyword=""):
+            from osmu_kr.content_generator.interfaces import ImageItem
+            return [ImageItem(url=f"https://i.example/{i}", filename=f"{slug}-{i}.jpg",
+                                alt=f"{alt_keyword} {i}")
+                    for i in range(1, count + 1)]
+
+    tmp = tempfile.mkdtemp(prefix="osmu_fallback_")
+    storage = LocalCsvStorage(data_dir=tmp)
+    gen = Generator(
+        storage=storage, crawler=EmptyCrawler(),
+        writer=StubWriter(), images=StubImages(),
+        config=GeneratorConfig(n_sources=3, n_images=2),
+    )
+    result = gen.generate("재테크")
+    assert result.status == "generated"
+    assert "외부 검색이 일시적으로" in result.error_log or result.error_log
+
+
+def test_generator_writer_failure_fallbacks_to_heuristic():
+    """LLM 실패 시 1회 retry 후 fallback_to_heuristic=True 면 휴리스틱으로 살아남음."""
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseWriter, BaseImageProvider, CrawledPage,
+    )
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+
+    class StubCrawler(BaseCrawler):
+        name = "s"
+        def search(self, query, *, limit=5):
+            return [f"https://x/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(
+                url=url,
+                content=("이 글은 키워드 관련 본문입니다. "
+                         "추천 정보를 충분히 담고 있습니다. "
+                         "독자에게 도움이 되는 내용입니다."),
+            )
+
+    class FailingWriter(BaseWriter):
+        name = "fail"
+        def write(self, *a, **kw):
+            raise RuntimeError("intentional")
+
+    class StubImages(BaseImageProvider):
+        name = "i"
+        def search(self, query, *, count=3, slug="", alt_keyword=""):
+            from osmu_kr.content_generator.interfaces import ImageItem
+            return [ImageItem(url=f"https://i/{i}", filename=f"{slug}-{i}.jpg",
+                                alt=f"{alt_keyword} {i}")
+                    for i in range(1, count + 1)]
+
+    tmp = tempfile.mkdtemp(prefix="osmu_writerfail_")
+    gen = Generator(
+        storage=LocalCsvStorage(data_dir=tmp),
+        crawler=StubCrawler(), writer=FailingWriter(), images=StubImages(),
+        config=GeneratorConfig(fallback_to_heuristic=True),
+    )
+    result = gen.generate("AI ETF")
+    assert "<h1>" in result.refined_post.lower()
+    assert "fallback" in result.error_log.lower()
+
+
 def test_revival_deprecates_low_score():
     """REVIVAL_DAYS 경과 + 점수 미달 → deprecated 마킹 후 풀에서 제거.
 
@@ -260,6 +546,17 @@ TESTS = [
     test_pre_filter_pipeline_records_history,
     test_manage_full_pipeline,
     test_revival_deprecates_low_score,
+    # ── content_generator ──
+    test_keyword_translator_korean_to_english_and_slug,
+    test_picsum_image_provider_returns_image_items,
+    test_chained_image_provider_dedup_and_renumber,
+    test_heuristic_writer_produces_html_with_images,
+    test_html_validation_detects_missing_images,
+    test_repair_missing_images_appends_when_writer_skips,
+    test_collector_with_stub_crawler,
+    test_generator_full_pipeline_with_stubs,
+    test_generator_firecrawl_fallback_to_template,
+    test_generator_writer_failure_fallbacks_to_heuristic,
 ]
 
 

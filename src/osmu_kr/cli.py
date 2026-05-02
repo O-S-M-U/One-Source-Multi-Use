@@ -37,6 +37,14 @@ def main(argv=None) -> int:
     sub.add_parser("show")
     sub.add_parser("config")
 
+    # ── 신규: 콘텐츠 생성 ──
+    s_gen = sub.add_parser("generate", help="키워드 → Firecrawl 검색 → SEO HTML 생성")
+    s_gen.add_argument("--keyword", required=True)
+    s_gen.add_argument("--title", default="", help="(선택) 최종 제목")
+    s_gen.add_argument("--no-save", action="store_true", help="content_db 저장 생략 (드라이런)")
+    s_gen.add_argument("--no-fallback", action="store_true",
+                        help="LLM 실패 시 휴리스틱 폴백 비활성")
+
     args = p.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -88,6 +96,32 @@ def main(argv=None) -> int:
             print(f"  {mark} {h.created_at[:16]} | {h.keyword[:30]:<30} "
                   f"{h.grade or '-':<3} {h.total_score:>5.1f}점 "
                   f"profile={h.profile}")
+        return 0
+    if args.cmd == "generate":
+        from .content_generator import Generator
+        from .content_generator.generator import GeneratorConfig
+        gen = Generator(
+            cfg=cfg,
+            config=GeneratorConfig(fallback_to_heuristic=not args.no_fallback),
+        )
+        result = gen.generate(args.keyword, save=not args.no_save,
+                                title_final=args.title)
+        print("=" * 60)
+        print("  ✍️  콘텐츠 생성 결과")
+        print("=" * 60)
+        print(f"  {result.to_summary()}")
+        if result.error_log:
+            print(f"  ⚠️  로그: {result.error_log}")
+        if result.original_source:
+            print(f"  출처: {len(result.original_source)}개")
+            for i, u in enumerate(result.original_source, 1):
+                print(f"    {i}. {u}")
+        if result.image_urls:
+            print(f"  이미지: {len(result.image_urls)}개")
+        print(f"\n  HTML 길이: {len(result.refined_post)}자")
+        print(f"  HTML 미리보기 (앞 200자):\n  {result.refined_post[:200]}...")
+        if result.record_id:
+            print(f"\n  ✅ content_db 저장됨 — id={result.record_id}")
         return 0
     if args.cmd == "show":
         print(cfg.summary())
