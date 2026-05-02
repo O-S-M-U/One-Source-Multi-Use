@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from ..models import ContentRecord, KeywordPoolItem
+from ..models import ContentRecord, KeywordPoolItem, ResearchHistoryRecord
 from .base import BaseStorage
 
 
@@ -11,7 +11,8 @@ class SheetsStorage(BaseStorage):
     name = "sheets"
 
     def __init__(self, credentials_path, sheet_id=None, sheet_title=None,
-                 ws_keyword_pool="keyword_pool", ws_content_db="content_db"):
+                 ws_keyword_pool="keyword_pool", ws_content_db="content_db",
+                 ws_history="research_history"):
         try:
             import gspread
             from google.oauth2.service_account import Credentials
@@ -36,6 +37,7 @@ class SheetsStorage(BaseStorage):
 
         self._ws_pool = self._ensure_ws(ws_keyword_pool, KeywordPoolItem.HEADER)
         self._ws_content = self._ensure_ws(ws_content_db, ContentRecord.HEADER)
+        self._ws_history = self._ensure_ws(ws_history, ResearchHistoryRecord.HEADER)
 
     def _ensure_ws(self, title, header):
         try:
@@ -95,3 +97,9 @@ class SheetsStorage(BaseStorage):
         self._ws_content.clear()
         rows = [ContentRecord.HEADER] + [r.to_row() for r in records]
         self._ws_content.update("A1", rows)
+
+    def append_history(self, record):
+        self._ws_history.append_row(record.to_row(), value_input_option="USER_ENTERED")
+
+    def list_history(self):
+        return [ResearchHistoryRecord.from_row(r) for r in self._rows_after_header(self._ws_history)]

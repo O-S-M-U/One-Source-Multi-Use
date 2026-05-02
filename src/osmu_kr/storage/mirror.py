@@ -140,6 +140,13 @@ class MirrorStorage(BaseStorage):
         self.local.replace_content(records)
         self._safe_sheets_call("replace_content", records)
 
+    def append_history(self, record):
+        self.local.append_history(record)
+        self._safe_sheets_call("append_history", record)
+
+    def list_history(self):
+        return self.local.list_history()
+
     def pull_from_sheets(self):
         sh = self._get_sheets()
         if sh is None:

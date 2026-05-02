@@ -153,6 +153,96 @@ def test_mirror_storage_falls_back_to_local_when_no_credentials():
     assert s.sheets_enabled is False
 
 
+def test_pool_item_grade_autofill():
+    from osmu_kr.models import KeywordPoolItem, grade_from_score
+    item = KeywordPoolItem(keyword_id="0001", seed_keyword="t", keyword="kw", score=85.0)
+    item.fill_grade()
+    assert item.grade == "황금"
+    item2 = KeywordPoolItem(keyword_id="0002", seed_keyword="t", keyword="kw2", score=50.0)
+    item2.fill_grade()
+    assert item2.grade == "보통"
+    assert grade_from_score(95) == "황금"
+    assert grade_from_score(70) == "좋은"
+    assert grade_from_score(20) == "미달"
+
+
+def test_research_history_round_trip():
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    from osmu_kr.models import ResearchHistoryRecord
+    tmp = tempfile.mkdtemp(prefix="osmu_history_")
+    s = LocalCsvStorage(data_dir=tmp)
+    rec = ResearchHistoryRecord(keyword="다이어트 추천", grade="황금",
+                                  total_score=85.0, profile="일반",
+                                  seed_keyword="다이어트", evaluator="heuristic")
+    s.append_history(rec)
+    out = s.list_history()
+    assert len(out) == 1
+    assert out[0].keyword == "다이어트 추천"
+    assert out[0].grade == "황금"
+
+
+def test_pre_filter_pipeline_records_history():
+    rs = fresh_researcher()
+    rep = rs.run_seed("다이어트")
+    history = rs.storage.list_history()
+    # 분석한 모든 키워드가 이력에 기록됨 (사전 필터 통과 분량)
+    assert len(history) >= rep.pre_filtered
+    # pool item에 grade 채워졌는지
+    for it in rs.storage.list_pool():
+        assert it.grade in ("황금", "좋은", "보통", "미달")
+
+
+def test_manage_full_pipeline():
+    """CLI manage 모드 — full_manage 가 ManageReport 를 정상 반환."""
+    rs = fresh_researcher()
+    rs.run_seed("AI ETF")
+    report = rs.manage()
+    assert report.pool_size_after >= 0
+    assert hasattr(report.prune, "revaluated")
+
+
+def test_revival_deprecates_low_score():
+    """REVIVAL_DAYS 경과 + 점수 미달 → deprecated 마킹 후 풀에서 제거.
+
+    결정적 테스트를 위해 항상 score=10 만 반환하는 평가기를 주입한다.
+    """
+    from datetime import timedelta
+    from osmu_kr.models import to_iso, now_utc, KeywordPoolItem, Evaluation
+    from osmu_kr.evaluator.base import BaseEvaluator
+    from osmu_kr import KeywordResearcher, Config
+
+    class AlwaysLowEvaluator(BaseEvaluator):
+        name = "always_low"
+        def evaluate(self, keyword, *, seed=""):
+            return Evaluation(score=10.0, raw={"evaluator": "always_low"})
+
+    tmp = tempfile.mkdtemp(prefix="osmu_revival_")
+    os.environ["OSMU_LOCAL_DATA_DIR"] = tmp
+    os.environ["OSMU_STORAGE_BACKEND"] = "local"
+    os.environ["OSMU_LOCAL_FORMAT"] = "csv"
+    os.environ["OSMU_REVIVAL_DAYS"] = "0.1"
+    os.environ["OSMU_GOLDEN_THRESHOLD"] = "65"
+    os.environ["OSMU_MEDIUM_LOWER"] = "45"
+    os.environ["OSMU_MEDIUM_UPPER"] = "65"
+    rs = KeywordResearcher(Config(), evaluator=AlwaysLowEvaluator())
+
+    fake = KeywordPoolItem(
+        keyword_id="9999", seed_keyword="저품질", keyword="저품질 샘플",
+        score=80.0, status="golden",
+    )
+    rs.storage.upsert_pool(fake)
+    items = rs.storage.list_pool()
+    past = now_utc() - timedelta(days=1)
+    for it in items:
+        it.updated_at = to_iso(past)
+        it.created_at = to_iso(past)
+    rs.storage.replace_pool(items)
+
+    pool, report = rs.prune(run_revival=True)
+    assert "9999" not in {it.keyword_id for it in pool}, "deprecated 처리 실패"
+    assert report.deprecated >= 1
+
+
 TESTS = [
     test_evaluator_deterministic,
     test_expander_includes_seed_and_dedups,
@@ -165,6 +255,11 @@ TESTS = [
     test_factory_xlsx_format,
     test_naver_golden_evaluator_falls_back_to_heuristic_without_creds,
     test_mirror_storage_falls_back_to_local_when_no_credentials,
+    test_pool_item_grade_autofill,
+    test_research_history_round_trip,
+    test_pre_filter_pipeline_records_history,
+    test_manage_full_pipeline,
+    test_revival_deprecates_low_score,
 ]
 
 

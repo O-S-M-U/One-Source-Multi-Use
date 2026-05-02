@@ -8,7 +8,7 @@ from typing import List, Optional
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-from ..models import ContentRecord, KeywordPoolItem
+from ..models import ContentRecord, KeywordPoolItem, ResearchHistoryRecord
 from .base import BaseStorage
 
 
@@ -16,6 +16,7 @@ class LocalXlsxStorage(BaseStorage):
     name = "xlsx"
     POOL_SHEET = "keyword_pool"
     CONTENT_SHEET = "content_db"
+    HISTORY_SHEET = "research_history"
 
     def __init__(self, data_dir: str = "./data", filename: str = "osmu_workbook.xlsx"):
         self.data_dir = data_dir
@@ -30,8 +31,10 @@ class LocalXlsxStorage(BaseStorage):
             wb.remove(wb.active)
             ws_p = wb.create_sheet(self.POOL_SHEET); ws_p.append(KeywordPoolItem.HEADER)
             ws_c = wb.create_sheet(self.CONTENT_SHEET); ws_c.append(ContentRecord.HEADER)
+            ws_h = wb.create_sheet(self.HISTORY_SHEET); ws_h.append(ResearchHistoryRecord.HEADER)
             self._auto_fit(ws_p, KeywordPoolItem.HEADER)
             self._auto_fit(ws_c, ContentRecord.HEADER)
+            self._auto_fit(ws_h, ResearchHistoryRecord.HEADER)
             wb.save(self.path)
             return
         wb = load_workbook(self.path)
@@ -42,6 +45,9 @@ class LocalXlsxStorage(BaseStorage):
         if self.CONTENT_SHEET not in wb.sheetnames:
             ws = wb.create_sheet(self.CONTENT_SHEET); ws.append(ContentRecord.HEADER)
             self._auto_fit(ws, ContentRecord.HEADER); changed = True
+        if self.HISTORY_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(self.HISTORY_SHEET); ws.append(ResearchHistoryRecord.HEADER)
+            self._auto_fit(ws, ResearchHistoryRecord.HEADER); changed = True
         if changed:
             wb.save(self.path)
 
@@ -124,3 +130,9 @@ class LocalXlsxStorage(BaseStorage):
 
     def replace_content(self, records):
         self._write_all(self.CONTENT_SHEET, ContentRecord.HEADER, [r.to_row() for r in records])
+
+    def append_history(self, record):
+        self._append_row(self.HISTORY_SHEET, record.to_row())
+
+    def list_history(self):
+        return [ResearchHistoryRecord.from_row(r) for r in self._read_rows(self.HISTORY_SHEET)]

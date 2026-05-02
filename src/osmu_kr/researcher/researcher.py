@@ -1,4 +1,4 @@
-"""KeywordResearcher 본체."""
+"""KeywordResearcher 본체 — 사전 필터 + 단계별 파이프라인 + 부활 심사 통합."""
 from __future__ import annotations
 
 import logging
@@ -8,10 +8,12 @@ from typing import List, Optional
 from ..config import Config
 from ..evaluator import build_evaluator, diagnose_weakness
 from ..evaluator.base import BaseEvaluator
+from ..evaluator.naver_golden import COMMERCIAL_WORDS as GOLDEN_COMMERCIAL_WORDS
 from ..models import (
+    GRADE_FAIL, GRADE_GOOD, GRADE_GOLDEN, GRADE_MEDIUM,
     STATUS_GOLDEN, STATUS_MEDIUM, STATUS_REJECTED,
-    ContentRecord, Evaluation, KeywordPoolItem,
-    now_utc, to_iso,
+    ContentRecord, Evaluation, KeywordPoolItem, ResearchHistoryRecord,
+    grade_from_score, now_utc, to_iso,
 )
 from ..storage import BaseStorage, build_storage
 from . import alchemist, expander, manager, recommender
@@ -23,6 +25,7 @@ log = logging.getLogger(__name__)
 class SeedRunReport:
     seed: str
     expanded: int = 0
+    pre_filtered: int = 0   # 사전 필터 통과 (비싼 API 호출 대상)
     accepted: int = 0
     transmuted: int = 0
     rejected: int = 0
@@ -30,8 +33,14 @@ class SeedRunReport:
 
     def summary(self):
         return (f"seed='{self.seed}' expanded={self.expanded} "
-                f"accepted={self.accepted} transmuted={self.transmuted} "
-                f"rejected={self.rejected}")
+                f"pre_filtered={self.pre_filtered} accepted={self.accepted} "
+                f"transmuted={self.transmuted} rejected={self.rejected}")
+
+
+def quick_score_commercial(keyword: str) -> int:
+    """상업적 의도만으로 빠른 사전 점수 (API 호출 없음). golden_keyword.py 호환."""
+    hits = [w for w in GOLDEN_COMMERCIAL_WORDS if w in keyword]
+    return 20 if len(hits) >= 2 else (15 if len(hits) == 1 else 0)
 
 
 class KeywordResearcher:
@@ -64,38 +73,69 @@ class KeywordResearcher:
         n = (max(nums) if nums else 0) + 1
         return f"{n:03d}"
 
-    def run_seed(self, seed: str, *, expand_limit: int = 10) -> SeedRunReport:
+    # ── 핵심: 사전 필터 + 단계별 파이프라인 ────────────────
+    def run_seed(self, seed: str, *, expand_limit: int = 10,
+                 pre_filter_top: int = 15) -> SeedRunReport:
+        """[ 5단계 파이프라인 ]
+        1. expand → 후보 (자동완성 + 접미어)
+        2. quick_score_commercial 로 상위 pre_filter_top 개 사전 선별 (API 호출 0)
+        3. 평가기 evaluate() — 비싼 API 호출
+        4. 황금/좋은(>= golden_threshold) → 풀 적재 / 보통 → 알케미 → evaluate_longtail
+        5. 분석 이력(research_history) 누적
+        """
         seed = (seed or "").strip()
         report = SeedRunReport(seed=seed)
         if not seed:
             return report
 
+        # ── Step 1: 후보 확장 ──
         candidates = expander.expand(seed, limit=expand_limit)
         report.expanded = len(candidates)
+
+        # ── Step 2: 사전 필터 (API 호출 없음) ──
+        # 씨앗 키워드 자체는 항상 포함, 나머지는 quick_score 내림차순
+        scored_candidates = sorted(
+            candidates,
+            key=lambda kw: (0 if kw == seed else -quick_score_commercial(kw))
+        )
+        top_candidates = scored_candidates[:pre_filter_top]
+        report.pre_filtered = len(top_candidates)
+
         accepted_buf = []
 
-        for kw in candidates:
+        # ── Step 3-4: 본 평가 + 알케미 ──
+        for kw in top_candidates:
             if self.storage.find_pool_by_keyword(kw):
                 continue
             ev = self.evaluator.evaluate(kw, seed=seed)
+
+            self._record_history(kw, ev, seed=seed, profile="일반",
+                                  is_alchemy=False, original_keyword="")
+
             if ev.score >= self.cfg.golden_threshold:
-                item = self._build_pool_item(seed, kw, ev, accepted_buf)
+                item = self._build_pool_item(seed, kw, ev, accepted_buf,
+                                              profile="일반", is_alchemy=False)
                 accepted_buf.append(item)
                 report.items.append(item)
                 report.accepted += 1
             elif self.cfg.medium_lower <= ev.score < self.cfg.medium_upper:
-                # 약점 진단 기반 처방형 알케미
                 weaknesses = diagnose_weakness(ev)
                 added_any = False
-                for variant in alchemist.transmute_with_diagnosis(kw, weaknesses, max_variants=5):
+                for variant in alchemist.transmute_with_diagnosis(
+                        kw, weaknesses, max_variants=5):
                     if self.storage.find_pool_by_keyword(variant):
                         continue
                     v_ev = self.evaluator.evaluate_longtail(variant, seed=seed)
+                    self._record_history(variant, v_ev, seed=seed,
+                                          profile="롱테일", is_alchemy=True,
+                                          original_keyword=kw)
                     if v_ev.score >= self.cfg.golden_threshold:
                         item = self._build_pool_item(
                             seed, variant, v_ev, accepted_buf,
                             source_suffix="+alchemy",
                             note=f"transmuted from '{kw}'",
+                            profile="롱테일", is_alchemy=True,
+                            original_keyword=kw,
                         )
                         accepted_buf.append(item)
                         report.items.append(item)
@@ -112,8 +152,52 @@ class KeywordResearcher:
         self._enforce_max_size()
         return report
 
-    def _build_pool_item(self, seed, keyword, ev, extra, source_suffix="", note=""):
-        return KeywordPoolItem(
+    def _record_history(self, keyword, ev, *, seed, profile, is_alchemy, original_keyword):
+        """research_history 시트에 분석 시점 스냅샷 기록."""
+        try:
+            raw = ev.raw or {}
+            dl = raw.get("datalab") or {}
+            blog = raw.get("blog") or {}
+            gt = raw.get("google_trends") or {}
+            comp = raw.get("commercial_hits") or []
+            weak = []
+            comp_scores = raw.get("components") or {}
+            weights = raw.get("weights") or {}
+            if comp_scores and weights:
+                if (comp_scores.get("commercial", 0) / max(1, weights.get("commercial", 20))) < 0.50:
+                    weak.append("상업의도부족")
+                if (comp_scores.get("blog", 0) / max(1, weights.get("blog_comp", 30))) < 0.40:
+                    weak.append("경쟁도높음")
+                if (comp_scores.get("datalab", 0) / max(1, weights.get("datalab", 40))) < 0.40:
+                    weak.append("트렌드낮음")
+
+            rec = ResearchHistoryRecord(
+                keyword=keyword,
+                grade=grade_from_score(ev.score),
+                total_score=round(ev.score, 2),
+                profile=profile,
+                datalab_score=float(dl.get("trend_score", 0) or 0),
+                datalab_direction=str(dl.get("trend_direction", "")),
+                blog_results=str(blog.get("total_results", "")) if blog.get("total_results") is not None else "",
+                blog_competition=str(blog.get("competition_label", "")),
+                commercial_hits=", ".join(comp) if comp else "없음",
+                gtrends_score=float(gt.get("trend_score", 0) or 0),
+                weak_points=", ".join(weak) if weak else "-",
+                is_alchemy="Y" if is_alchemy else "N",
+                original_keyword=original_keyword,
+                seed_keyword=seed,
+                evaluator=self.evaluator.name,
+            )
+            self.storage.append_history(rec)
+        except Exception as e:
+            log.warning("history 기록 실패 (무시): %s", e)
+
+    def _build_pool_item(self, seed, keyword, ev, extra,
+                         source_suffix="", note="",
+                         profile="일반", is_alchemy=False, original_keyword=""):
+        # 약점 진단
+        weak = diagnose_weakness(ev) if profile == "일반" else []
+        item = KeywordPoolItem(
             keyword_id=self._next_keyword_id(extra),
             seed_keyword=seed,
             keyword=keyword,
@@ -125,13 +209,25 @@ class KeywordResearcher:
             status=STATUS_GOLDEN,
             source=f"{self.evaluator.name}{source_suffix}",
             note=note,
+            grade=grade_from_score(ev.score),
+            profile=profile,
+            weak_points=", ".join(w.replace("_", "") for w in weak),
+            is_alchemy="Y" if is_alchemy else "N",
+            original_keyword=original_keyword,
+            revival_count=0,
         )
+        return item
 
     def _enforce_max_size(self):
         pool = self.storage.list_pool()
         if len(pool) <= self.cfg.pool_max_size:
             return
-        pool.sort(key=lambda x: x.score, reverse=True)
+        # 등급 우선, 그 다음 점수 — golden_keyword.py 정책
+        from ..models import GRADE_ORDER
+        pool.sort(
+            key=lambda x: (-GRADE_ORDER.get(x.grade or grade_from_score(x.score), 0),
+                           -x.score)
+        )
         self.storage.replace_pool(pool[: self.cfg.pool_max_size])
 
     def check_keyword(self, keyword, *, seed=None):
@@ -141,6 +237,8 @@ class KeywordResearcher:
         seed = (seed or keyword).strip()
         existing = self.storage.find_pool_by_keyword(keyword)
         ev = self.evaluator.evaluate(keyword, seed=seed)
+        self._record_history(keyword, ev, seed=seed, profile="일반",
+                              is_alchemy=False, original_keyword="")
         if existing:
             existing.search_volume = ev.search_volume
             existing.competition = ev.competition
@@ -149,11 +247,13 @@ class KeywordResearcher:
             existing.score = ev.score
             existing.updated_at = to_iso(now_utc())
             existing.status = STATUS_GOLDEN if ev.score >= self.cfg.golden_threshold else STATUS_MEDIUM
+            existing.grade = grade_from_score(ev.score)
             self.storage.upsert_pool(existing)
             return existing
 
         status = (STATUS_GOLDEN if ev.score >= self.cfg.golden_threshold
                   else (STATUS_MEDIUM if ev.score >= self.cfg.medium_lower else STATUS_REJECTED))
+        weak = diagnose_weakness(ev)
         item = KeywordPoolItem(
             keyword_id=self._next_keyword_id(),
             seed_keyword=seed,
@@ -166,13 +266,24 @@ class KeywordResearcher:
             status=status,
             source=f"{self.evaluator.name}/manual",
             note="user-checked",
+            grade=grade_from_score(ev.score),
+            profile="일반",
+            weak_points=", ".join(w.replace("_", "") for w in weak),
+            is_alchemy="N",
+            revival_count=0,
         )
         if status != STATUS_REJECTED:
             self.storage.upsert_pool(item)
         return item
 
-    def prune(self):
-        return manager.prune(self.storage, self.evaluator, self.cfg)
+    def prune(self, *, run_revival: bool = True):
+        """기본은 부활 심사 포함. False면 단순 만료만."""
+        return manager.prune(self.storage, self.evaluator, self.cfg,
+                              run_revival=run_revival)
+
+    def manage(self):
+        """CLI manage 모드 — 부활 심사 + 정리 + 추천 미리보기."""
+        return manager.full_manage(self.storage, self.evaluator, self.cfg)
 
     def recommend(self, top_n=5):
         return recommender.recommend(self.storage, self.cfg, top_n=top_n)

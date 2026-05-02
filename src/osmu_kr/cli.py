@@ -32,6 +32,8 @@ def main(argv=None) -> int:
     s_sel.add_argument("--source", default="")
 
     sub.add_parser("prune")
+    sub.add_parser("manage")    # 정기 점검 — cron 등 자동화용
+    sub.add_parser("history")   # 분석 이력 조회
     sub.add_parser("show")
     sub.add_parser("config")
 
@@ -64,6 +66,29 @@ def main(argv=None) -> int:
     if args.cmd == "prune":
         pool, report = rs.prune()
         print(report.summary()); return 0
+    if args.cmd == "manage":
+        report = rs.manage()
+        print("=" * 60)
+        print("  🔧 키워드 풀 정기 점검 결과")
+        print("=" * 60)
+        print(f"  풀 크기: {report.pool_size_before} → {report.pool_size_after}")
+        print(f"  활성(active) 황금 키워드: {report.active_count}")
+        print(f"  {report.prune.summary()}")
+        if report.top_recommendations:
+            print("\n  현재 추천 TOP 5:")
+            for i, it in enumerate(report.top_recommendations, 1):
+                print(f"    {i}위 [{it.keyword}] {it.grade or '-'} {it.score:.0f}점")
+        print("=" * 60)
+        return 0
+    if args.cmd == "history":
+        history = rs.storage.list_history()
+        print(f"\n[research_history] {len(history)} 건")
+        for h in history[-30:]:
+            mark = "🥇" if h.grade == "황금" else ("🥈" if h.grade == "좋은" else "  ")
+            print(f"  {mark} {h.created_at[:16]} | {h.keyword[:30]:<30} "
+                  f"{h.grade or '-':<3} {h.total_score:>5.1f}점 "
+                  f"profile={h.profile}")
+        return 0
     if args.cmd == "show":
         print(cfg.summary())
         for it in rs.storage.list_pool():

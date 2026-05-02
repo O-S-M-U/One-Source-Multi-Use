@@ -5,7 +5,7 @@ import csv
 import os
 from typing import List, Optional
 
-from ..models import ContentRecord, KeywordPoolItem
+from ..models import ContentRecord, KeywordPoolItem, ResearchHistoryRecord
 from .base import BaseStorage
 
 
@@ -17,8 +17,10 @@ class LocalCsvStorage(BaseStorage):
         os.makedirs(self.data_dir, exist_ok=True)
         self.pool_path = os.path.join(self.data_dir, "keyword_pool.csv")
         self.content_path = os.path.join(self.data_dir, "content_db.csv")
+        self.history_path = os.path.join(self.data_dir, "research_history.csv")
         self._ensure_header(self.pool_path, KeywordPoolItem.HEADER)
         self._ensure_header(self.content_path, ContentRecord.HEADER)
+        self._ensure_header(self.history_path, ResearchHistoryRecord.HEADER)
 
     @staticmethod
     def _ensure_header(path: str, header: list) -> None:
@@ -80,3 +82,11 @@ class LocalCsvStorage(BaseStorage):
 
     def replace_content(self, records):
         self._write_all(self.content_path, ContentRecord.HEADER, [r.to_row() for r in records])
+
+    # ── research_history ──
+    def append_history(self, record):
+        with open(self.history_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(record.to_row())
+
+    def list_history(self):
+        return [ResearchHistoryRecord.from_row(r) for r in self._read_rows(self.history_path)]
