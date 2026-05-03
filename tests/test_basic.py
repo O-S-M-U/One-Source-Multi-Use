@@ -536,6 +536,111 @@ def test_generator_writer_failure_fallbacks_to_heuristic():
     assert "fallback" in result.error_log.lower()
 
 
+def test_update_content_in_place():
+    """update_content — id 와 created_at 은 보존, 나머지 필드만 갱신."""
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    from osmu_kr.models import ContentRecord
+    tmp = tempfile.mkdtemp(prefix="osmu_upd_")
+    s = LocalCsvStorage(data_dir=tmp)
+    s.append_content(ContentRecord(id="001", keyword="A",
+                                    refined_post="old", status="대기중",
+                                    created_at="2026-01-01T00:00:00+0000"))
+
+    ok = s.update_content("001", refined_post="new HTML", status="generated",
+                          # 보호 필드는 무시돼야 함
+                          id="999", created_at="2030-12-31T00:00:00+0000")
+    assert ok is True
+    rows = s.list_content()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.id == "001", "id 가 변경되면 안 됨"
+    assert r.created_at == "2026-01-01T00:00:00+0000", "created_at 도 보호"
+    assert r.refined_post == "new HTML"
+    assert r.status == "generated"
+
+    # 없는 id
+    assert s.update_content("999", refined_post="x") is False
+
+
+def test_generator_retry_record_in_place():
+    """retry_record — 같은 id 에 결과 in-place 갱신, status='generated'."""
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseWriter, BaseImageProvider, CrawledPage, ImageItem,
+    )
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    from osmu_kr.models import ContentRecord
+
+    class StubCrawler(BaseCrawler):
+        name = "s"
+        def search(self, q, *, limit=5):
+            return [f"https://x/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(url=url,
+                                content="이 글은 키워드 본문입니다. 추천 정보를 담고 있습니다. "
+                                        "독자에게 유용한 내용입니다.")
+    class StubWriter(BaseWriter):
+        name = "w"
+        def write(self, kw, raw, *, sources=None, images=None, tone="전문적"):
+            return f"<h1>{kw} retry</h1><h2>본문</h2><p>{raw[:80]}</p>"
+    class StubImages(BaseImageProvider):
+        name = "i"
+        def search(self, q, *, count=3, slug="", alt_keyword=""):
+            return [ImageItem(url=f"https://i/{i}", filename=f"{slug or 'x'}-{i}.jpg",
+                                alt=f"{alt_keyword} {i}", role="concept")
+                    for i in range(1, count + 1)]
+
+    tmp = tempfile.mkdtemp(prefix="osmu_retry_")
+    storage = LocalCsvStorage(data_dir=tmp)
+    # 작성 대기 record 1개 — refined_post 비어 있음
+    storage.append_content(ContentRecord(
+        id="001", keyword="다이어트 추천", status="대기중",
+        refined_post="", created_at="2026-01-01T00:00:00+0000",
+    ))
+
+    gen = Generator(
+        storage=storage, crawler=StubCrawler(), writer=StubWriter(), images=StubImages(),
+        config=GeneratorConfig(n_sources=3, n_images=3),
+    )
+    result = gen.retry_record("001")
+    assert result.record_id == "001"
+    assert "<h1>" in result.refined_post
+
+    # storage 에서 같은 id 로 읽으면 새 결과
+    refreshed = next(r for r in storage.list_content() if r.id == "001")
+    assert refreshed.id == "001"
+    assert refreshed.created_at == "2026-01-01T00:00:00+0000"  # 보존
+    assert refreshed.status == "generated"
+    assert "<h1>" in refreshed.refined_post
+    assert "retried" in refreshed.note
+
+
+def test_generator_retry_record_missing_id_raises():
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    import tempfile as _tf
+    storage = LocalCsvStorage(data_dir=_tf.mkdtemp(prefix="osmu_retry_missing_"))
+    gen = Generator(storage=storage,
+                     crawler=type("C", (), {
+                         "name": "n", "search": lambda *a, **k: [],
+                         "scrape": lambda *a, **k: None,
+                         "search_and_scrape": lambda *a, **k: [],
+                     })(),
+                     writer=type("W", (), {
+                         "name": "w",
+                         "write": lambda self, *a, **k: "<h1>x</h1>",
+                     })(),
+                     images=type("I", (), {
+                         "name": "i", "search": lambda *a, **k: [],
+                     })())
+    try:
+        gen.retry_record("nonexistent")
+    except KeyError:
+        return
+    raise AssertionError("KeyError 가 발생해야 합니다")
+
+
 def test_delete_content_csv_round_trip():
     """LocalCsvStorage 의 delete_content — append 후 삭제하면 사라짐."""
     from osmu_kr.storage.csv_local import LocalCsvStorage
@@ -712,6 +817,9 @@ TESTS = [
     test_research_history_round_trip,
     test_pre_filter_pipeline_records_history,
     test_manage_full_pipeline,
+    test_update_content_in_place,
+    test_generator_retry_record_in_place,
+    test_generator_retry_record_missing_id_raises,
     test_delete_content_csv_round_trip,
     test_delete_content_xlsx_round_trip,
     test_delete_content_mirror_delegates_to_local,

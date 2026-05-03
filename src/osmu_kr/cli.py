@@ -53,6 +53,12 @@ def main(argv=None) -> int:
     s_del.add_argument("--yes", action="store_true",
                         help="확인 프롬프트 없이 즉시 삭제 (cron 등 자동화용)")
 
+    s_re = sub.add_parser("regenerate",
+                           help="기존 ContentRecord 의 keyword 로 글을 다시 생성 (in-place 갱신)")
+    s_re.add_argument("--id", required=True, help="재생성할 ContentRecord.id")
+    s_re.add_argument("--require-real-images", action="store_true",
+                       help="picsum 폴백 비활성 — Unsplash 이미지만 사용")
+
     args = p.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -136,6 +142,36 @@ def main(argv=None) -> int:
             return 0
         print(f"❌  삭제 실패 (id 가 풀에 없거나 백엔드 오류)")
         return 1
+    if args.cmd == "regenerate":
+        from .content_generator import Generator
+        from .content_generator.generator import GeneratorConfig
+        target_id = args.id.strip()
+        rec = next((r for r in rs.storage.list_content() if r.id == target_id), None)
+        if not rec:
+            print(f"❌ id={target_id} 콘텐츠를 찾지 못했어요.")
+            return 1
+        print("=" * 60)
+        print(f"  🔁  재생성 대상")
+        print("=" * 60)
+        print(f"  id        : {rec.id}")
+        print(f"  keyword   : {rec.keyword}")
+        print(f"  status    : {rec.status}")
+        print(f"  HTML 길이 : {len(rec.refined_post or '')} 자  → 새 결과로 덮어씁니다")
+        print("=" * 60)
+        gen = Generator(
+            cfg=cfg, storage=rs.storage,
+            config=GeneratorConfig(require_real_images=args.require_real_images),
+        )
+        try:
+            result = gen.retry_record(target_id)
+        except Exception as e:
+            print(f"❌  재생성 실패: {e}")
+            return 1
+        print(f"✅  id={result.record_id} 재생성 완료")
+        print(f"    {result.to_summary()}")
+        if result.error_log:
+            print(f"    로그: {result.error_log}")
+        return 0
     if args.cmd == "generate":
         from .content_generator import Generator
         from .content_generator.generator import GeneratorConfig
