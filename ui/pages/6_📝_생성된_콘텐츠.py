@@ -18,9 +18,12 @@ from typing import List
 import streamlit as st
 
 from services import (
+    delete_content_record,
     get_content_dataframe,
     get_researcher,
+    humanize_error,
     log_activity,
+    retry_content_record,
     settings_snapshot,
 )
 from osmu_kr.models import ContentRecord
@@ -255,26 +258,135 @@ for r in filtered:
             if r["error_log"]:
                 st.error(f"error_log: {r['error_log']}")
 
-        # 하단 액션
-        ba1, ba2, ba3, _ = st.columns([1, 1, 1, 4])
+        # ── 하단 액션 (재시도 / 다운로드 / 본문 / 삭제) ──
+        ba1, ba2, ba3, ba4, ba5 = st.columns([1.1, 1, 1, 1, 2])
+
+        # ── 재시도 (대기중/실패는 즉시 / generated 는 1단계 확인) ──
+        retry_confirm_key = f"_confirm_retry_{r['id']}"
+        retry_confirming = st.session_state.get(retry_confirm_key, False)
+        needs_confirm_retry = r["status"] == "generated"
+
         with ba1:
+            if not retry_confirming:
+                btn_label = "🔁  재시도"
+                if st.button(btn_label, key=f"retry_{r['id']}",
+                              use_container_width=True,
+                              help="이 키워드로 글을 다시 생성합니다 (같은 글 ID 유지)."):
+                    if needs_confirm_retry:
+                        st.session_state[retry_confirm_key] = True
+                        st.rerun()
+                    else:
+                        # 대기중/실패 — 즉시 실행
+                        with st.spinner(f"id={r['id']} 재생성 중…"):
+                            res = retry_content_record(r["id"])
+                        if res.get("ok"):
+                            st.toast(f"id={r['id']} 재생성 완료 ({res['html_len']}자)",
+                                      icon="✨")
+                            log_activity("success", "콘텐츠 재시도",
+                                          f"id={r['id']} keyword='{r['keyword']}' "
+                                          f"→ {res['html_len']}자",
+                                          res.get("error_log") or "")
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"재시도 실패: {res.get('reason')}")
+                            log_activity("error", "콘텐츠 재시도",
+                                          str(res.get("reason")), str(res))
+            else:
+                if st.button("✅  재생성 확정", key=f"retry_yes_{r['id']}",
+                              type="primary", use_container_width=True):
+                    with st.spinner(f"id={r['id']} 재생성 중…"):
+                        res = retry_content_record(r["id"])
+                    st.session_state.pop(retry_confirm_key, None)
+                    if res.get("ok"):
+                        st.toast(f"id={r['id']} 재생성 완료 ({res['html_len']}자)",
+                                  icon="✨")
+                        log_activity("success", "콘텐츠 재시도",
+                                      f"id={r['id']} keyword='{r['keyword']}' "
+                                      f"→ {res['html_len']}자",
+                                      res.get("error_log") or "")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"재시도 실패: {res.get('reason')}")
+
+        with ba2:
             if r["refined_post"]:
                 st.download_button(
-                    "💾  HTML 다운로드",
+                    "💾  HTML",
                     data=r["refined_post"],
                     file_name=f"{r['id']}_{r['keyword'][:30]}.html".replace("/", "-"),
                     mime="text/html",
                     key=f"dl_{r['id']}",
                     use_container_width=True,
                 )
-        with ba2:
-            if st.button("📋  본문 복사용 보기", key=f"raw_{r['id']}",
+        with ba3:
+            if st.button("📋  본문 보기", key=f"raw_{r['id']}",
                           use_container_width=True):
                 st.code(r["refined_post"][:2000] + ("…" if len(r["refined_post"]) > 2000 else ""),
                           language="html")
-        with ba3:
-            if r["status"] == "generated":
-                st.caption("✅ Slack 검토 → 발행 준비 가능")
+
+        # ── 삭제 (2단계 확인) ──
+        confirm_key = f"_confirm_delete_{r['id']}"
+        is_confirming = st.session_state.get(confirm_key, False)
+
+        with ba4:
+            if not is_confirming:
+                if st.button("🗑  삭제", key=f"del_{r['id']}",
+                              use_container_width=True,
+                              help="이 콘텐츠를 content_db 에서 영구 삭제합니다."):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
+            else:
+                if st.button("✅  삭제 확정", key=f"del_yes_{r['id']}",
+                              type="primary", use_container_width=True):
+                    try:
+                        ok = delete_content_record(r["id"])
+                        if ok:
+                            st.toast(f"id={r['id']} 삭제 완료", icon="🗑")
+                            log_activity("success", "콘텐츠 삭제",
+                                          f"id={r['id']} keyword='{r['keyword']}'")
+                            st.session_state.pop(confirm_key, None)
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"id={r['id']} 를 찾지 못했어요.")
+                            st.session_state.pop(confirm_key, None)
+                    except Exception as e:
+                        st.error(humanize_error(e))
+                        log_activity("error", "콘텐츠 삭제", humanize_error(e), str(e))
+                        st.session_state.pop(confirm_key, None)
+        with ba5:
+            if is_confirming:
+                if st.button("↩️  삭제 취소", key=f"del_no_{r['id']}",
+                              use_container_width=True):
+                    st.session_state.pop(confirm_key, None)
+                    st.rerun()
+            elif retry_confirming:
+                if st.button("↩️  재시도 취소", key=f"retry_no_{r['id']}",
+                              use_container_width=True):
+                    st.session_state.pop(retry_confirm_key, None)
+                    st.rerun()
+            else:
+                if r["status"] == "대기중":
+                    st.caption("⏳ ‘🔁 재시도’ 로 글 작성 시작")
+                elif r["status"] == "실패":
+                    st.caption("❌ ‘🔁 재시도’ 로 다시 시도")
+                elif r["status"] == "generated":
+                    st.caption("✅ Slack 검토 → 발행")
+
+        if is_confirming:
+            st.warning(
+                f"⚠️ **id={r['id']}** ({r['keyword']}) 콘텐츠를 정말 삭제하시겠어요? "
+                "이 작업은 되돌릴 수 없습니다.",
+                icon="⚠️",
+            )
+        if retry_confirming:
+            st.warning(
+                f"🔁 **id={r['id']}** ({r['keyword']}) 콘텐츠를 다시 생성합니다. "
+                "현재 본문(HTML)·이미지가 새로 생성된 결과로 **덮어써집니다**.",
+                icon="🔁",
+            )
 
 # ── 푸터 — 디버그 정보 ──────────────────────────────
 st.divider()

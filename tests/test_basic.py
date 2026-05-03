@@ -536,6 +536,124 @@ def test_generator_writer_failure_fallbacks_to_heuristic():
     assert "fallback" in result.error_log.lower()
 
 
+def test_delete_content_csv_round_trip():
+    """LocalCsvStorage 의 delete_content — append 후 삭제하면 사라짐."""
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    from osmu_kr.models import ContentRecord
+    tmp = tempfile.mkdtemp(prefix="osmu_del_csv_")
+    s = LocalCsvStorage(data_dir=tmp)
+    s.append_content(ContentRecord(id="001", keyword="A"))
+    s.append_content(ContentRecord(id="002", keyword="B"))
+    s.append_content(ContentRecord(id="003", keyword="C"))
+    assert {r.id for r in s.list_content()} == {"001", "002", "003"}
+
+    assert s.delete_content("002") is True
+    ids = {r.id for r in s.list_content()}
+    assert ids == {"001", "003"}, f"002 가 안 지워짐: {ids}"
+
+    # 없는 id 는 False
+    assert s.delete_content("999") is False
+    # 빈 id 는 False
+    assert s.delete_content("") is False
+
+
+def test_delete_content_xlsx_round_trip():
+    """LocalXlsxStorage 의 delete_content — 엑셀 시트에서도 동일하게 동작."""
+    from osmu_kr.storage.xlsx_local import LocalXlsxStorage
+    from osmu_kr.models import ContentRecord
+    tmp = tempfile.mkdtemp(prefix="osmu_del_xlsx_")
+    s = LocalXlsxStorage(data_dir=tmp)
+    s.append_content(ContentRecord(id="001", keyword="A"))
+    s.append_content(ContentRecord(id="002", keyword="B"))
+    assert s.delete_content("001") is True
+    assert {r.id for r in s.list_content()} == {"002"}
+
+
+def test_delete_content_mirror_delegates_to_local():
+    """Mirror 백엔드는 local 에 delete 적용 + sheets 호출 (없으면 보류큐)."""
+    from osmu_kr.storage.csv_local import LocalCsvStorage
+    from osmu_kr.storage.mirror import MirrorStorage
+    from osmu_kr.models import ContentRecord
+    tmp = tempfile.mkdtemp(prefix="osmu_del_mirror_")
+    local = LocalCsvStorage(data_dir=tmp)
+    local.append_content(ContentRecord(id="001", keyword="A"))
+    local.append_content(ContentRecord(id="002", keyword="B"))
+
+    def fail_factory():
+        raise RuntimeError("no creds")
+
+    mirror = MirrorStorage(local=local, sheets_factory=fail_factory)
+    assert mirror.delete_content("001") is True
+    assert {r.id for r in mirror.list_content()} == {"002"}
+
+
+def test_keyword_classifier_game_domain():
+    """게임 키워드는 GAME 도메인으로 분류."""
+    from osmu_kr.content_generator.keyword_classifier import classify, profile_for, Domain
+    assert classify("데드바이데이라이트") == Domain.GAME
+    assert classify("리그오브레전드 추천 챔프") == Domain.GAME
+    assert classify("Elden Ring 공략") == Domain.GAME
+
+    profile = profile_for("데드바이데이라이트")
+    assert profile.domain == Domain.GAME
+    assert "게임" in profile.name_ko
+    # 도메인 섹션이 게임 특화인지
+    assert any("초보자" in t for t in profile.section_titles)
+    assert any("플레이" in t or "전략" in t or "빌드" in t
+               for t in profile.section_titles)
+
+
+def test_keyword_classifier_other_domains():
+    from osmu_kr.content_generator.keyword_classifier import classify, Domain
+    assert classify("AI ETF 추천") == Domain.FINANCE
+    assert classify("직장인 다이어트 식단") == Domain.DIET
+    assert classify("맥북 프로 추천") == Domain.IT
+    assert classify("선크림 추천") == Domain.BEAUTY
+    assert classify("도쿄 여행 코스") == Domain.TRAVEL
+    assert classify("파스타 레시피") == Domain.FOOD
+    assert classify("랜덤 일반 키워드") == Domain.GENERAL
+
+
+def test_heuristic_writer_game_keyword_no_seed_leak():
+    """게임 키워드 + 폴백 시드 입력 → 본문에 ‘목차 안내문’ 노출 X + 게임 특화 섹션."""
+    from osmu_kr.content_generator.writer import (
+        HeuristicWriter, FALLBACK_SEED_MARKER, BANNED_PHRASES,
+    )
+    from osmu_kr.content_generator.interfaces import ImageItem
+
+    w = HeuristicWriter()
+    seed_input = (
+        f"{FALLBACK_SEED_MARKER}\n"
+        "이 텍스트는 절대 본문에 그대로 노출되면 안 됩니다. 시드 마커 포함."
+    )
+    images = [
+        ImageItem(url="https://x/1", filename="dbd-1.jpg", alt="a", role="concept"),
+        ImageItem(url="https://x/2", filename="dbd-2.jpg", alt="b", role="example"),
+        ImageItem(url="https://x/3", filename="dbd-3.jpg", alt="c", role="comparison"),
+    ]
+    html = w.write("데드바이데이라이트", seed_input, images=images, sources=[])
+    # 시드 텍스트가 본문에 그대로 노출되지 않아야 함
+    assert FALLBACK_SEED_MARKER not in html
+    assert "이 텍스트는 절대 본문에" not in html
+    assert "절대 본문에 그대로 노출" not in html
+
+    # 도메인 섹션이 적용됐는지 — 게임 키워드라면 ‘초보자’ 또는 ‘플레이’ 가 H2 에 등장
+    h2_section = html.lower()
+    assert "초보자" in html or "플레이" in html
+    # 금지 표현 없음
+    for phrase in BANNED_PHRASES:
+        assert phrase not in html, f"금지 표현 발견: {phrase}"
+
+
+def test_heuristic_writer_finance_keyword_uses_finance_sections():
+    from osmu_kr.content_generator.writer import HeuristicWriter
+    w = HeuristicWriter()
+    html = w.write("AI ETF 추천", "", images=[], sources=[])
+    # 금융 섹션 어휘
+    assert ("수익률" in html or "리스크" in html
+            or "투자" in html or "포트폴리오" in html)
+
+
 def test_revival_deprecates_low_score():
     """REVIVAL_DAYS 경과 + 점수 미달 → deprecated 마킹 후 풀에서 제거.
 
@@ -594,6 +712,13 @@ TESTS = [
     test_research_history_round_trip,
     test_pre_filter_pipeline_records_history,
     test_manage_full_pipeline,
+    test_delete_content_csv_round_trip,
+    test_delete_content_xlsx_round_trip,
+    test_delete_content_mirror_delegates_to_local,
+    test_keyword_classifier_game_domain,
+    test_keyword_classifier_other_domains,
+    test_heuristic_writer_game_keyword_no_seed_leak,
+    test_heuristic_writer_finance_keyword_uses_finance_sections,
     test_revival_deprecates_low_score,
     # ── content_generator ──
     test_keyword_translator_korean_to_english_and_slug,

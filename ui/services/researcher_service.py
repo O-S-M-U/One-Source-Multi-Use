@@ -57,6 +57,40 @@ def get_local_xlsx_path() -> str | None:
     return p if os.path.isfile(p) else None
 
 
+def delete_content_record(content_id: str) -> bool:
+    """content_db 에서 콘텐츠 1건 삭제. 성공 시 True."""
+    rs = get_researcher()
+    return rs.storage.delete_content(content_id)
+
+
+def retry_content_record(content_id: str, *, require_real_images: bool = False) -> dict:
+    """콘텐츠 재생성. 같은 id 에 결과 in-place 갱신.
+
+    Returns dict — {ok, record_id, html_len, status, error_log, html_issues}
+    실패 시 {ok: False, reason}.
+    """
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    rs = get_researcher()
+    try:
+        gen = Generator(
+            cfg=rs.cfg,
+            storage=rs.storage,
+            config=GeneratorConfig(require_real_images=require_real_images),
+        )
+        result = gen.retry_record(content_id)
+        return {
+            "ok": True,
+            "record_id": result.record_id,
+            "html_len": len(result.refined_post),
+            "status": result.status,
+            "error_log": result.error_log,
+            "html_issues": result.html_issues,
+        }
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
 def apply_settings(form_values: dict) -> None:
     mapping = {
         "storage_backend": "OSMU_STORAGE_BACKEND",

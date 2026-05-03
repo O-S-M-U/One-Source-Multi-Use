@@ -140,6 +140,17 @@ class MirrorStorage(BaseStorage):
         self.local.replace_content(records)
         self._safe_sheets_call("replace_content", records)
 
+    def delete_content(self, content_id):
+        ok = self.local.delete_content(content_id)
+        # Sheets 도 동일하게 시도 (실패해도 보류 큐에 누적)
+        self._safe_sheets_call("delete_content", content_id)
+        return ok
+
+    def update_content(self, content_id, **fields):
+        ok = self.local.update_content(content_id, **fields)
+        self._safe_sheets_call("update_content", content_id, **fields)
+        return ok
+
     def append_history(self, record):
         self.local.append_history(record)
         self._safe_sheets_call("append_history", record)

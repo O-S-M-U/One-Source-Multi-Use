@@ -38,21 +38,31 @@ from .interfaces import (
     GenerationResult, ImageItem,
 )
 from .keyword_translator import keyword_to_slug
+from .keyword_classifier import profile_for
 from .writer import (
-    AnthropicWriter, HeuristicWriter,
+    AnthropicWriter, FALLBACK_SEED_MARKER, HeuristicWriter,
     repair_missing_images, strip_banned_phrases, validate_html_structure,
 )
 
 log = logging.getLogger(__name__)
 
 
-# raw_content 가 부족할 때 Writer 에 전달할 ‘일반 시드’ — 신뢰도 저하 표현 0개.
-# Writer 의 시스템 프롬프트가 이 시드를 받아 본문을 풍부하게 확장하도록 유도한다.
-_FALLBACK_SEED_TEMPLATE = (
-    "{keyword} 의 정의, 활용 방법, 자주 하는 실수, 비교 기준, 그리고 다음 단계로 "
-    "확장하는 방법까지 한 글에서 정리합니다. 처음 접하는 독자가 핵심 흐름을 빠르게 "
-    "잡을 수 있도록 개념 → 사례 → 주의사항 → 핵심 요약 순서로 구성합니다."
-)
+def _fallback_seed_text(keyword: str) -> str:
+    """raw_content 가 비었을 때 Writer 에 전달할 ‘목차 안내’ 시드.
+
+    이 텍스트는 LLM 입력으로만 사용되며 절대 본문에 그대로 노출되면 안 된다.
+    HeuristicWriter 가 FALLBACK_SEED_MARKER 를 보고 본문 직접 인용을 회피한다.
+    AnthropicWriter 는 시스템 프롬프트가 ‘목차 안내문 노출 금지’ 를 명시함.
+    """
+    profile = profile_for(keyword)
+    intents = "; ".join(profile.search_intents)
+    return (
+        f"{FALLBACK_SEED_MARKER}\n"
+        f"키워드 '{keyword}' (도메인: {profile.name_ko}) 에 대해 다음 검색 의도를 "
+        f"충족하는 글이 필요합니다: {intents}. "
+        f"섹션 구조는 다음을 따라주세요: "
+        + " / ".join(profile.section_titles)
+    )
 
 
 @dataclass
@@ -107,7 +117,7 @@ class Generator:
         if raw.is_empty():
             crawl_error = raw.error or "raw_content_empty"
             log.warning("[generator] raw_content 없음 → 일반 시드 사용 (%s)", crawl_error)
-            seed_text = _FALLBACK_SEED_TEMPLATE.format(keyword=kw)
+            seed_text = _fallback_seed_text(kw)
             raw = RawContent(
                 keyword=kw, sources=[], pages=[],
                 text=seed_text,
@@ -254,3 +264,51 @@ class Generator:
             keyword, "", raw, images, status="실패",
             error_log=f"writer_failed: {err}", writer_used="failed",
         )
+
+    # ── 재시도: 기존 record 의 keyword 로 다시 생성, 같은 id 에 in-place 갱신 ──
+    def retry_record(self, content_id: str) -> GenerationResult:
+        """기존 ContentRecord 를 받아 같은 키워드로 글을 다시 생성하고
+        같은 id 를 유지한 채 refined_post / image_urls / status / error_log 를 갱신.
+
+        - 새 row 추가가 아니라 in-place 업데이트라서 id, created_at 은 그대로 유지.
+        - 검토/발행 흐름의 ‘제출 단위’ 가 깨지지 않는다.
+        - keyword 또는 record 자체가 없으면 KeyError.
+        """
+        if not content_id:
+            raise ValueError("content_id 가 비어 있습니다.")
+
+        existing = next(
+            (r for r in self.storage.list_content() if r.id == content_id), None,
+        )
+        if existing is None:
+            raise KeyError(f"content_id={content_id} record 가 없습니다.")
+
+        kw = (existing.keyword or "").strip()
+        if not kw:
+            raise ValueError(f"content_id={content_id} 의 keyword 가 비어 있어 재생성 불가.")
+
+        log.info("▶ retry_record(id=%s, keyword=%r) 시작", content_id, kw)
+
+        # generate() 는 새 row 를 append 하므로, save=False 로 호출해 결과만 받는다.
+        result = self.generate(kw, save=False, title_final=existing.title_final)
+
+        # 기존 row 갱신
+        new_image_urls_json = self._images_to_json(result.image_urls)
+        new_sources = ", ".join(result.original_source)
+        ok = self.storage.update_content(
+            content_id,
+            keyword=kw,
+            refined_post=result.refined_post,
+            image_urls=new_image_urls_json,
+            original_source=new_sources,
+            raw_content=result.raw_content[:8000],
+            status="generated",
+            error_log=(result.error_log or "") + " | retried",
+            note=(existing.note + " | retried" if existing.note else "retried"),
+        )
+        if not ok:
+            log.warning("update_content 실패 — record 사라졌을 수 있음")
+
+        # 결과에 record_id 채워서 반환
+        result.record_id = content_id
+        return result

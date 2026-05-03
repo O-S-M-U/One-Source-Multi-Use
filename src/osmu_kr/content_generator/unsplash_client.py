@@ -18,6 +18,7 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 from .interfaces import ImageItem
+from .keyword_classifier import profile_for
 from .keyword_translator import (
     caption_for_role,
     keyword_to_slug,
@@ -133,61 +134,70 @@ class UnsplashClient:
             log.info("[unsplash] UNSPLASH_ACCESS_KEY 없음 → 빈 결과 반환")
             return []
 
-        queries = translate_to_english_queries(keyword, max_queries=3)
-        if not queries:
-            return []
+        # 1) 도메인 분류 → 도메인별 image_query_templates 우선 사용
+        profile = profile_for(keyword)
+        domain_queries = profile.image_query_templates
+        # 2) keyword 자체의 영어 변환도 함께 (보조)
+        translated = translate_to_english_queries(keyword, max_queries=2)
 
-        log.debug("[unsplash] '%s' → 검색 후보: %s", keyword, queries)
+        log.info("[unsplash] '%s' → 도메인=%s, 보조 쿼리=%s",
+                  keyword, profile.domain.value, translated)
 
-        # 후보 query 들을 순서대로 시도하면서 결과 누적 (중복 제거)
-        seen_ids: set[str] = set()
-        candidates: list[dict] = []
-        per_query = max(5, n_target * 2)
-        query_tokens = [t for q in queries for t in q.split()]
-
-        for q in queries:
-            results = self._search_one_query(q, per_page=per_query)
-            for r in results:
-                _id = r.get("id")
-                if not _id or _id in seen_ids:
-                    continue
-                # 해상도 필터
-                w = int(r.get("width") or 0)
-                h = int(r.get("height") or 0)
-                if w and h and (w < self.min_width or h < self.min_height):
-                    continue
-                # 관련도 필터
-                if not _is_relevant(r.get("description"), r.get("alt_description"),
-                                    query_tokens):
-                    continue
-                seen_ids.add(_id)
-                candidates.append(r)
-                if len(candidates) >= n_target:
-                    break
-            if len(candidates) >= n_target:
-                break
-
-        if not candidates:
-            log.warning("[unsplash] 결과 없음 (query=%s)", queries)
-            return []
-
-        # ImageItem 변환 — 각 이미지에 role(concept/example/comparison/...) 부여
+        # 각 role 별로 다른 검색어 사용 → 다양성 확보
         items: List[ImageItem] = []
-        for i, r in enumerate(candidates[:n_target], start=1):
-            urls = r.get("urls") or {}
+        seen_ids: set[str] = set()
+        roles_needed = ["concept", "example", "comparison", "summary"][:n_target]
+
+        for i, role in enumerate(roles_needed, start=1):
+            # role 별 쿼리: 도메인 템플릿 + 키워드 변환 + 키워드 그대로
+            role_queries = list(domain_queries.get(role, []))
+            # 키워드 영어 변환 결과를 첫 후보 앞에 추가 (도메인 검색어가 더 우선)
+            role_queries.extend(translated)
+            # 매핑되지 않으면 영어 변환만으로
+            if not role_queries:
+                role_queries = translated[:] or [keyword]
+
+            picked = None
+            query_tokens = [t for q in role_queries for t in q.split()]
+            for q in role_queries:
+                results = self._search_one_query(q, per_page=5)
+                for r in results:
+                    _id = r.get("id")
+                    if not _id or _id in seen_ids:
+                        continue
+                    w = int(r.get("width") or 0)
+                    h = int(r.get("height") or 0)
+                    if w and h and (w < self.min_width or h < self.min_height):
+                        continue
+                    if not _is_relevant(r.get("description"), r.get("alt_description"),
+                                        query_tokens):
+                        continue
+                    picked = r
+                    seen_ids.add(_id)
+                    break
+                if picked:
+                    break
+
+            if not picked:
+                continue
+
+            urls = picked.get("urls") or {}
             url = urls.get("regular") or urls.get("small") or urls.get("full") or ""
             if not url:
                 continue
             ext = _ext_from_url(url)
-            role = role_for_index(i)
             items.append(ImageItem(
                 url=url,
                 filename=make_filename(slug_prefix, i, ext),
                 alt=make_alt_text(alt_kw, i, role=role),
-                width=int(r.get("width") or 0),
-                height=int(r.get("height") or 0),
+                width=int(picked.get("width") or 0),
+                height=int(picked.get("height") or 0),
                 source="unsplash",
                 role=role,
                 caption=caption_for_role(alt_kw, role),
             ))
+
+        if not items:
+            log.warning("[unsplash] 도메인=%s 검색 결과 0건", profile.domain.value)
+            return []
         return items
