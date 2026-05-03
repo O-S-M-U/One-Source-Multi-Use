@@ -19,9 +19,11 @@ from urllib.parse import urlparse
 
 from .interfaces import ImageItem
 from .keyword_translator import (
+    caption_for_role,
     keyword_to_slug,
     make_alt_text,
     make_filename,
+    role_for_index,
     translate_to_english_queries,
 )
 
@@ -169,7 +171,7 @@ class UnsplashClient:
             log.warning("[unsplash] 결과 없음 (query=%s)", queries)
             return []
 
-        # ImageItem 변환
+        # ImageItem 변환 — 각 이미지에 role(concept/example/comparison/...) 부여
         items: List[ImageItem] = []
         for i, r in enumerate(candidates[:n_target], start=1):
             urls = r.get("urls") or {}
@@ -177,12 +179,15 @@ class UnsplashClient:
             if not url:
                 continue
             ext = _ext_from_url(url)
+            role = role_for_index(i)
             items.append(ImageItem(
                 url=url,
                 filename=make_filename(slug_prefix, i, ext),
-                alt=make_alt_text(alt_kw, i),
+                alt=make_alt_text(alt_kw, i, role=role),
                 width=int(r.get("width") or 0),
                 height=int(r.get("height") or 0),
                 source="unsplash",
+                role=role,
+                caption=caption_for_role(alt_kw, role),
             ))
         return items

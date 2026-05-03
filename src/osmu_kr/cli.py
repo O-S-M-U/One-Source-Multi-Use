@@ -44,6 +44,8 @@ def main(argv=None) -> int:
     s_gen.add_argument("--no-save", action="store_true", help="content_db 저장 생략 (드라이런)")
     s_gen.add_argument("--no-fallback", action="store_true",
                         help="LLM 실패 시 휴리스틱 폴백 비활성")
+    s_gen.add_argument("--require-real-images", action="store_true",
+                        help="picsum 폴백 비활성 — Unsplash 이미지만 사용 (운영 권장)")
 
     args = p.parse_args(argv)
     logging.basicConfig(
@@ -102,7 +104,10 @@ def main(argv=None) -> int:
         from .content_generator.generator import GeneratorConfig
         gen = Generator(
             cfg=cfg,
-            config=GeneratorConfig(fallback_to_heuristic=not args.no_fallback),
+            config=GeneratorConfig(
+                fallback_to_heuristic=not args.no_fallback,
+                require_real_images=args.require_real_images,
+            ),
         )
         result = gen.generate(args.keyword, save=not args.no_save,
                                 title_final=args.title)

@@ -28,10 +28,17 @@ class CrawledPage:
 
 @dataclass
 class ImageItem:
-    """본문 삽입용 이미지 — URL + 파일명 + 메타.
+    """본문 삽입용 이미지 — URL + 파일명 + 역할(role) + 메타.
 
     파일명 규칙: ${slug}-${idx}.${ext}
       예) "직장인 다이어트 식단" → "office-diet-meal-1.jpg" / "office-diet-meal-2.jpg"
+
+    role 은 콘텐츠 안에서 이 이미지가 무슨 의미로 쓰이는지 명시한다.
+    Writer 가 글 구조와 매핑할 때 사용한다.
+      · "concept"     — 개념 설명 섹션. 1번 이미지에 권장
+      · "example"     — 실제 활용 사례 섹션. 2번 이미지에 권장
+      · "comparison"  — 비교/주의사항 섹션. 3번 이미지에 권장
+      · "summary"     — 마무리 정리. 추가 이미지가 있을 때
 
     실제 파일 저장이 아니라 ‘발행/검토 단계의 식별자’ 로 사용된다 (Slack/티스토리 발행 시).
     """
@@ -41,6 +48,8 @@ class ImageItem:
     width: int = 0
     height: int = 0
     source: str = ""        # 'unsplash' / 'picsum' / ...
+    role: str = ""          # 'concept' / 'example' / 'comparison' / 'summary'
+    caption: str = ""       # 본문 figcaption 으로 사용할 수 있는 짧은 설명
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +59,8 @@ class ImageItem:
             "width": self.width,
             "height": self.height,
             "source": self.source,
+            "role": self.role,
+            "caption": self.caption,
         }
 
 

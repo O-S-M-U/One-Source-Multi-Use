@@ -48,12 +48,24 @@ st.divider()
 st.subheader("📝 최근 작성 대기 / 작성한 글")
 df = get_content_dataframe()
 if hasattr(df, "empty") and df.empty:
-    st.info("아직 작성한 글이 없어요.")
+    st.info("아직 작성한 글이 없어요. ‘① 키워드 생성’ 후 위에서 ‘이 키워드로 글 쓰기’를 눌러보세요.")
 else:
-    rename = {"id": "글 ID", "keyword": "키워드", "seed_keyword": "주제",
-              "status": "상태", "title_final": "제목", "created_at": "등록일시",
-              "platform_url": "발행 URL"}
-    show = df.rename(columns=rename) if hasattr(df, "rename") else df
-    if hasattr(show, "sort_values"):
+    STATUS_LABEL = {
+        "generated": "🟢 생성 완료", "대기중": "⏳ 작성 대기",
+        "생성중": "✏️ 생성 중", "검토중": "👀 검토 중",
+        "승인완료": "✅ 승인 완료", "발행완료": "🚀 발행 완료",
+        "발행차단": "🛑 발행 차단", "실패": "❌ 실패",
+    }
+    show = df.copy() if hasattr(df, "copy") else df
+    if hasattr(show, "rename"):
+        show["상태"] = show["status"].map(lambda s: STATUS_LABEL.get(s, f"• {s}"))
+        show = show.rename(columns={
+            "id": "글 ID", "keyword": "키워드", "seed_keyword": "주제",
+            "title_final": "제목", "created_at": "등록일시",
+            "platform_url": "발행 URL",
+        })
+        cols = ["글 ID", "키워드", "주제", "상태", "제목", "등록일시", "발행 URL"]
+        show = show[[c for c in cols if c in show.columns]]
         show = show.sort_values(by="등록일시", ascending=False)
     st.dataframe(show, use_container_width=True, hide_index=True)
+    st.caption("💡 본문 HTML 을 그대로 보고 싶으면 좌측 메뉴의 **‘📝 ⑥ 생성된 콘텐츠’** 페이지로 이동하세요.")

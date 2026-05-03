@@ -177,7 +177,45 @@ def make_filename(slug: str, index: int, ext: str = "jpg") -> str:
     return f"{safe_slug}-{index}.{safe_ext}"
 
 
-def make_alt_text(keyword: str, index: int) -> str:
-    """SEO 친화 alt 텍스트 — 한글 키워드 그대로 + 번호."""
+def make_alt_text(keyword: str, index: int, role: str = "") -> str:
+    """SEO 친화 alt 텍스트 — 한글 키워드 + 역할이 있으면 역할까지 포함."""
     kw = (keyword or "").strip()
-    return f"{kw} 관련 이미지 {index}" if kw else f"본문 이미지 {index}"
+    role_label = ROLE_KO.get(role, "")
+    if kw and role_label:
+        return f"{kw} — {role_label}"
+    if kw:
+        return f"{kw} 관련 이미지 {index}"
+    return f"본문 이미지 {index}"
+
+
+# 이미지 역할 — 콘텐츠 섹션과 매핑
+IMAGE_ROLES = ("concept", "example", "comparison", "summary")
+ROLE_KO = {
+    "concept":    "개념 설명",
+    "example":    "실제 활용 사례",
+    "comparison": "비교 및 주의사항",
+    "summary":    "핵심 요약",
+}
+
+
+def role_for_index(index_one_based: int) -> str:
+    """1번부터 IMAGE_ROLES 순서대로 매핑. 4번 초과 시 마지막 role(summary) 반복."""
+    if index_one_based <= 0:
+        return ""
+    if index_one_based > len(IMAGE_ROLES):
+        return IMAGE_ROLES[-1]
+    return IMAGE_ROLES[index_one_based - 1]
+
+
+def caption_for_role(keyword: str, role: str) -> str:
+    """figcaption 용 짧은 설명. 본문에 자연스럽게 녹아들 수 있게 한국어로."""
+    kw = (keyword or "").strip()
+    if role == "concept":
+        return f"{kw}의 기본 개념을 시각적으로 보여주는 장면"
+    if role == "example":
+        return f"{kw}을(를) 실제로 활용하는 모습"
+    if role == "comparison":
+        return f"{kw} 선택 시 주의 깊게 살펴봐야 할 부분"
+    if role == "summary":
+        return f"{kw} 핵심 요약을 떠올리게 하는 이미지"
+    return f"{kw} 관련 이미지"

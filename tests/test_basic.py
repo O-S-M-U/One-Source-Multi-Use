@@ -220,19 +220,67 @@ def test_keyword_translator_korean_to_english_and_slug():
     assert fn == "office-diet-meal-1.jpg"
 
 
-def test_picsum_image_provider_returns_image_items():
-    """폴백은 항상 동작 + ImageItem 형태 + 파일명 규칙."""
+def test_picsum_image_provider_returns_image_items_with_roles():
+    """폴백은 항상 동작 + role 부여 (concept/example/comparison)."""
     from osmu_kr.content_generator.images import PicsumImageProvider
     from osmu_kr.content_generator.interfaces import ImageItem
     p = PicsumImageProvider()
     items = p.search("직장인 다이어트 식단", count=3)
     assert len(items) == 3
+    expected_roles = ["concept", "example", "comparison"]
     for i, it in enumerate(items, 1):
         assert isinstance(it, ImageItem)
         assert it.url.startswith("https://picsum.photos/")
         assert it.filename == f"office-diet-meal-{i}.jpg"
-        assert "직장인 다이어트 식단" in it.alt
         assert it.source == "picsum"
+        assert it.role == expected_roles[i - 1]
+        # alt 텍스트에 한국어 역할 라벨 포함
+        assert ("직장인 다이어트 식단" in it.alt or "관련 이미지" in it.alt)
+        assert it.caption  # caption 채워짐
+
+
+def test_html_validator_detects_banned_phrases():
+    from osmu_kr.content_generator.writer import validate_html_structure
+    bad = ('<h1>x</h1><h2>1</h2><p>외부 검색이 일시적으로 어려워 기본 가이드를 보여드립니다.</p>'
+           '<h2>2</h2><p>본문</p><h2>3</h2><p>본문</p>'
+           '<img src="a"/><img src="b"/>')
+    issues = validate_html_structure(bad, expected_image_count=2, min_h2=3, min_p=3)
+    assert any(i.startswith("banned_phrase") for i in issues)
+
+
+def test_strip_banned_phrases_removes_offending_paragraphs():
+    from osmu_kr.content_generator.writer import strip_banned_phrases
+    html = ('<h1>x</h1>'
+            '<p>이 글은 외부 검색이 일시적으로 어려워 작성됐습니다.</p>'
+            '<p>이건 정상 본문 단락입니다. 충분한 내용을 담고 있습니다.</p>')
+    cleaned = strip_banned_phrases(html)
+    assert "외부 검색이" not in cleaned
+    assert "이건 정상 본문 단락입니다" in cleaned
+
+
+def test_heuristic_writer_no_banned_phrases_and_4_sections():
+    """폴백 Writer 도 신뢰도 저하 표현 없고 H2 4개 + 충분한 단락 생성."""
+    from osmu_kr.content_generator.writer import HeuristicWriter, BANNED_PHRASES
+    from osmu_kr.content_generator.interfaces import ImageItem
+    w = HeuristicWriter()
+    images = [
+        ImageItem(url="https://x/1.jpg", filename="a-1.jpg", alt="a", role="concept"),
+        ImageItem(url="https://x/2.jpg", filename="a-2.jpg", alt="b", role="example"),
+        ImageItem(url="https://x/3.jpg", filename="a-3.jpg", alt="c", role="comparison"),
+    ]
+    html = w.write("AI ETF 추천", "", images=images, sources=[])
+    # H2 4개 (개념/활용/주의/요약)
+    h2_count = html.lower().count("<h2")
+    assert h2_count >= 4
+    # 금지 표현 없음
+    for phrase in BANNED_PHRASES:
+        assert phrase not in html, f"금지 표현 발견: {phrase}"
+    # 이미지 3개 모두 figure + figcaption
+    assert html.count("<img") >= 2
+    assert html.count("<figcaption") >= 2
+    # role 속성 유지
+    assert 'data-role="concept"' in html
+    assert 'data-role="example"' in html
 
 
 def test_chained_image_provider_dedup_and_renumber():
@@ -276,13 +324,14 @@ def test_heuristic_writer_produces_html_with_images():
 def test_html_validation_detects_missing_images():
     from osmu_kr.content_generator.writer import validate_html_structure
     bad = "<h1>제목</h1><h2>본문</h2><p>글</p>"
-    issues = validate_html_structure(bad, expected_image_count=2)
+    # 이미지 누락 검출 — 다른 검증은 느슨하게(min_h2=1, min_p=1)
+    issues = validate_html_structure(bad, expected_image_count=2, min_h2=1, min_p=1)
     assert any(i.startswith("insufficient_images") for i in issues)
 
     good = ('<h1>x</h1><h2>y</h2><p>z</p>'
             '<img src="https://a/1.jpg" alt="a 1"/>'
             '<img src="https://a/2.jpg" alt="a 2"/>')
-    assert validate_html_structure(good, expected_image_count=2) == []
+    assert validate_html_structure(good, expected_image_count=2, min_h2=1, min_p=1) == []
 
 
 def test_repair_missing_images_appends_when_writer_skips():
@@ -548,7 +597,10 @@ TESTS = [
     test_revival_deprecates_low_score,
     # ── content_generator ──
     test_keyword_translator_korean_to_english_and_slug,
-    test_picsum_image_provider_returns_image_items,
+    test_picsum_image_provider_returns_image_items_with_roles,
+    test_html_validator_detects_banned_phrases,
+    test_strip_banned_phrases_removes_offending_paragraphs,
+    test_heuristic_writer_no_banned_phrases_and_4_sections,
     test_chained_image_provider_dedup_and_renumber,
     test_heuristic_writer_produces_html_with_images,
     test_html_validation_detects_missing_images,

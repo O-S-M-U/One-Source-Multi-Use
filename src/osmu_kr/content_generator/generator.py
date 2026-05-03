@@ -40,14 +40,18 @@ from .interfaces import (
 from .keyword_translator import keyword_to_slug
 from .writer import (
     AnthropicWriter, HeuristicWriter,
-    repair_missing_images, validate_html_structure,
+    repair_missing_images, strip_banned_phrases, validate_html_structure,
 )
 
 log = logging.getLogger(__name__)
 
-FALLBACK_TEXT_TEMPLATE = (
-    "‘{keyword}’ 에 대한 핵심 정보를 정리한 글입니다. 외부 검색이 일시적으로 어려워 "
-    "기본 가이드를 바탕으로 작성됐으며, 정확한 최신 정보는 공식 출처를 함께 확인하시기 바랍니다."
+
+# raw_content 가 부족할 때 Writer 에 전달할 ‘일반 시드’ — 신뢰도 저하 표현 0개.
+# Writer 의 시스템 프롬프트가 이 시드를 받아 본문을 풍부하게 확장하도록 유도한다.
+_FALLBACK_SEED_TEMPLATE = (
+    "{keyword} 의 정의, 활용 방법, 자주 하는 실수, 비교 기준, 그리고 다음 단계로 "
+    "확장하는 방법까지 한 글에서 정리합니다. 처음 접하는 독자가 핵심 흐름을 빠르게 "
+    "잡을 수 있도록 개념 → 사례 → 주의사항 → 핵심 요약 순서로 구성합니다."
 )
 
 
@@ -55,9 +59,12 @@ FALLBACK_TEXT_TEMPLATE = (
 class GeneratorConfig:
     n_sources: int = 3
     n_images: int = 3
-    min_images: int = 2          # 정책: 최소 2장
+    min_images: int = 2                 # 정책: 최소 2장
     fallback_to_heuristic: bool = True
     pool_max_chars: int = 6000
+    require_real_images: bool = False   # True 면 picsum 폴백 비활성 (Unsplash 만)
+    min_h2_sections: int = 3
+    min_paragraphs: int = 5
 
 
 class Generator:
@@ -71,11 +78,17 @@ class Generator:
         self.storage = storage or build_storage(self.cfg)
         self.crawler = crawler or FirecrawlClient()
         self.writer = writer or AnthropicWriter()
-        self.images = images or ChainedImageProvider([
-            UnsplashImageProvider(),
-            PicsumImageProvider(),
-        ])
         self.gencfg = config or GeneratorConfig()
+        # 이미지 Provider — require_real_images=True 면 Unsplash 만 사용
+        if images is not None:
+            self.images = images
+        elif self.gencfg.require_real_images:
+            self.images = UnsplashImageProvider()
+        else:
+            self.images = ChainedImageProvider([
+                UnsplashImageProvider(),
+                PicsumImageProvider(),
+            ])
         self._collector = Collector(self.crawler, min_sources=self.gencfg.n_sources)
 
     # ── 공개 API ─────────────────────────────────
@@ -93,11 +106,13 @@ class Generator:
         crawl_error = ""
         if raw.is_empty():
             crawl_error = raw.error or "raw_content_empty"
-            log.warning("[generator] Firecrawl 폴백: %s", crawl_error)
+            log.warning("[generator] raw_content 없음 → 일반 시드 사용 (%s)", crawl_error)
+            seed_text = _FALLBACK_SEED_TEMPLATE.format(keyword=kw)
             raw = RawContent(
                 keyword=kw, sources=[], pages=[],
-                text=FALLBACK_TEXT_TEMPLATE.format(keyword=kw),
-                char_count=len(FALLBACK_TEXT_TEMPLATE), error=crawl_error,
+                text=seed_text,
+                char_count=len(seed_text),
+                error=crawl_error,
             )
 
         # ── Step 2: 이미지 (글 생성 직전) ──
@@ -112,8 +127,8 @@ class Generator:
             image_error = f"image_search_failed: {e}"
             log.warning("[generator] %s", image_error)
 
-        if len(images) < self.gencfg.min_images:
-            # 부족 시 picsum 폴백으로 보충 — 시스템 중단 X
+        if len(images) < self.gencfg.min_images and not self.gencfg.require_real_images:
+            # 부족 시 picsum 폴백 (require_real_images=False 일 때만)
             need = self.gencfg.min_images - len(images)
             try:
                 fallback = PicsumImageProvider().search(
@@ -122,6 +137,9 @@ class Generator:
                 images.extend(fallback)
             except Exception as e:
                 image_error = (image_error + " | picsum_fallback_failed: " + str(e)).strip(" |")
+        elif len(images) < self.gencfg.min_images and self.gencfg.require_real_images:
+            image_error = (image_error +
+                            f" | unsplash_only_yielded:{len(images)}/{self.gencfg.min_images}").strip(" |")
 
         if not images:
             image_error = (image_error + " | no_images_used").strip(" |")
@@ -148,12 +166,25 @@ class Generator:
                     self._save_failed(kw, raw, images, write_error)
                 raise RuntimeError(f"콘텐츠 생성 실패: {e}") from e
 
-        # ── Step 4: HTML 검증 + 보강 ──
+        # ── Step 4a: 금지 표현 자동 제거 (신뢰도 보호) ──
+        html = strip_banned_phrases(html)
+
+        # ── Step 4b: HTML 구조 + 내용 검증 + 이미지 보강 ──
         expected_imgs = max(self.gencfg.min_images, len(images))
-        issues = validate_html_structure(html, expected_image_count=expected_imgs)
+        issues = validate_html_structure(
+            html,
+            expected_image_count=expected_imgs,
+            min_h2=self.gencfg.min_h2_sections,
+            min_p=self.gencfg.min_paragraphs,
+        )
         if any(i.startswith("insufficient_images") for i in issues) and images:
             html = repair_missing_images(html, images)
-            issues = validate_html_structure(html, expected_image_count=expected_imgs)
+            issues = validate_html_structure(
+                html,
+                expected_image_count=expected_imgs,
+                min_h2=self.gencfg.min_h2_sections,
+                min_p=self.gencfg.min_paragraphs,
+            )
 
         # ── Step 5: content_db 저장 ──
         record_id = ""

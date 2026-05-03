@@ -1,8 +1,8 @@
-"""ImageProvider 구현체 — 모두 ImageItem 리스트 반환.
+"""ImageProvider 구현체 — 모두 ImageItem (role 포함) 리스트 반환.
 
   · UnsplashImageProvider  : UnsplashClient 위임 (자격증명 필요)
-  · PicsumImageProvider    : 폴백 (자격증명 불필요, 항상 동작)
-  · ChainedImageProvider   : 여러 Provider 순차 시도
+  · PicsumImageProvider    : 폴백 (자격증명 불필요, 항상 동작) — 명시적 opt-in 권장
+  · ChainedImageProvider   : 여러 Provider 순차 시도, role 보존
 """
 from __future__ import annotations
 
@@ -11,7 +11,13 @@ import urllib.parse
 from typing import List, Optional
 
 from .interfaces import BaseImageProvider, ImageItem
-from .keyword_translator import keyword_to_slug, make_alt_text, make_filename
+from .keyword_translator import (
+    caption_for_role,
+    keyword_to_slug,
+    make_alt_text,
+    make_filename,
+    role_for_index,
+)
 from .unsplash_client import UnsplashClient
 
 log = logging.getLogger(__name__)
@@ -31,7 +37,11 @@ class UnsplashImageProvider(BaseImageProvider):
 
 
 class PicsumImageProvider(BaseImageProvider):
-    """폴백 — picsum.photos 의 seed 기반 결정적 이미지."""
+    """폴백 — picsum.photos 의 seed 기반 결정적 이미지.
+
+    실 운영에서는 ChainedImageProvider 의 fallback 으로만 사용 권장.
+    Generator 에서 ‘require_real_images=True’ 가 켜지면 이 Provider 는 우회된다.
+    """
     name = "picsum"
 
     def __init__(self, width: int = 1200, height: int = 675):
@@ -45,21 +55,25 @@ class PicsumImageProvider(BaseImageProvider):
         items: List[ImageItem] = []
         for i in range(1, count + 1):
             url = f"https://picsum.photos/seed/{seed_base}-{i}/{self.width}/{self.height}"
+            role = role_for_index(i)
             items.append(ImageItem(
                 url=url,
                 filename=make_filename(slug_prefix, i, "jpg"),
-                alt=make_alt_text(alt_kw, i),
+                alt=make_alt_text(alt_kw, i, role=role),
                 width=self.width,
                 height=self.height,
                 source="picsum",
+                role=role,
+                caption=caption_for_role(alt_kw, role),
             ))
         return items
 
 
 class ChainedImageProvider(BaseImageProvider):
-    """여러 Provider 순서대로 시도. 첫 번째로 충분한 결과 반환한 곳을 사용.
+    """여러 Provider 를 순서대로 시도해 ImageItem 을 모은다.
 
-    `min_required` 만큼 안 채워지면 다음 Provider 로 보충 (혼합).
+    role/filename/alt 는 ‘최종 인덱스 기준’ 으로 일관 재배치한다 — 어떤 Provider 가
+    부분 결과를 줘도 ‘1번=concept, 2번=example, ...’ 매핑이 깨지지 않는다.
     """
     name = "chained"
 
@@ -81,15 +95,17 @@ class ChainedImageProvider(BaseImageProvider):
                     collected.append(it)
                     if len(collected) >= count:
                         break
-            if len(collected) >= self.min_required:
-                # 충분히 채워졌으면 다음 Provider 로 가지 않아도 OK
-                if len(collected) >= count:
-                    break
-        # 파일명에 인덱스 일관 적용 — provider 가 제각기 매긴 인덱스 무시하고 재정렬
+            if len(collected) >= count:
+                break
+
+        # 메타데이터 재정렬: 1번=concept, 2번=example ...
         slug_prefix = slug or keyword_to_slug(query)
         alt_kw = alt_keyword or query
         for i, it in enumerate(collected, start=1):
             ext = (it.filename.split(".")[-1] if "." in it.filename else "jpg").lower()
+            role = role_for_index(i)
             it.filename = make_filename(slug_prefix, i, ext)
-            it.alt = make_alt_text(alt_kw, i)
+            it.role = role
+            it.alt = make_alt_text(alt_kw, i, role=role)
+            it.caption = caption_for_role(alt_kw, role)
         return collected[:count]

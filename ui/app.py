@@ -37,16 +37,19 @@ c4.metric("저장 위치",
 
 st.divider()
 st.subheader("바로 시작하기")
-b1, b2, b3 = st.columns(3)
+b1, b2, b3, b4 = st.columns(4)
 with b1:
-    if st.button("🌱  씨앗 키워드 입력하기", use_container_width=True, type="primary"):
+    if st.button("🌱  씨앗 키워드 입력", use_container_width=True, type="primary"):
         st.switch_page("pages/1_🌱_키워드_생성.py")
 with b2:
-    if st.button("⭐  추천 키워드 보기", use_container_width=True):
+    if st.button("⭐  추천 보기", use_container_width=True):
         st.switch_page("pages/3_⭐_추천_및_선택.py")
 with b3:
-    if st.button("📦  키워드 풀 관리", use_container_width=True):
+    if st.button("📦  키워드 풀", use_container_width=True):
         st.switch_page("pages/2_📦_키워드_풀.py")
+with b4:
+    if st.button("📝  생성된 콘텐츠", use_container_width=True):
+        st.switch_page("pages/6_📝_생성된_콘텐츠.py")
 
 st.subheader("⭐ 지금 추천드리는 키워드 TOP 5")
 recs = rs.recommend(top_n=5)
