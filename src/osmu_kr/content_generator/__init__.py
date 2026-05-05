@@ -11,6 +11,7 @@ from .interfaces import (
 )
 from .firecrawl_client import FirecrawlClient
 from .collector import Collector, RawContent
+from .keyword_context import KeywordContext, infer_intent
 from .writer import AnthropicWriter, HeuristicWriter
 from .images import UnsplashImageProvider, PicsumImageProvider
 from .generator import Generator
@@ -19,6 +20,7 @@ __all__ = [
     "BaseCrawler", "BaseWriter", "BaseImageProvider",
     "CrawledPage", "GenerationResult",
     "FirecrawlClient", "Collector", "RawContent",
+    "KeywordContext", "infer_intent",
     "AnthropicWriter", "HeuristicWriter",
     "UnsplashImageProvider", "PicsumImageProvider",
     "Generator",

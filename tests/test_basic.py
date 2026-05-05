@@ -801,6 +801,122 @@ def test_revival_deprecates_low_score():
     assert report.deprecated >= 1
 
 
+def test_keyword_context_game_keyword_carries_topic():
+    """1단계 핵심 — '데드바이데이라이트' → inferred_topic='게임' 가 살아있어야 한다."""
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    assert ctx.keyword == "데드바이데이라이트 공략"
+    assert ctx.inferred_topic == "게임"
+    assert ctx.domain == "game"
+    assert ctx.intent_hint == "공략"
+    # 로그 한 줄 — '게임 관련' 힌트가 사람이 읽기 좋게 들어가는지 확인
+    assert "게임" in ctx.short()
+    assert "공략" in ctx.short()
+
+
+def test_keyword_context_intent_inference():
+    """간단한 룰 기반 intent 추론 — 추천/비교/리뷰 모두 잡혀야 한다."""
+    from osmu_kr.content_generator.keyword_context import (
+        KeywordContext, infer_intent,
+    )
+
+    assert infer_intent("AI ETF 추천 2025") == "추천"
+    assert infer_intent("아이폰 vs 갤럭시 비교") == "비교"
+    assert infer_intent("로봇청소기 리뷰") == "리뷰"
+    assert infer_intent("재테크 방법") == "방법"
+    assert infer_intent("그냥 키워드") == "정보"        # 기본값
+    # 도메인 분류가 빈 문자열에 대해서도 안전하게 동작해야 함
+    empty = KeywordContext.from_keyword("")
+    assert empty.keyword == ""
+    assert empty.inferred_topic == "일반"
+    assert empty.intent_hint == "정보"
+
+
+def test_keyword_context_coerce_accepts_str_and_passthrough():
+    """coerce: str / KeywordContext / None 모두 KeywordContext 를 돌려준다."""
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    a = KeywordContext.coerce("리그오브레전드 추천")
+    assert a.inferred_topic == "게임"
+    assert a.intent_hint == "추천"
+
+    b = KeywordContext.coerce(a)               # passthrough
+    assert b is a
+
+    c = KeywordContext.coerce(None)            # None → 빈 컨텍스트
+    assert c.keyword == ""
+    assert c.inferred_topic == "일반"
+
+
+def test_collector_logs_topic_hint_for_game_keyword(caplog=None):
+    """완료 기준 그 자체 — collector 입력 로그에 '게임 관련 키워드' 힌트가 포함된다."""
+    import io, logging
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, query, *, limit=5):
+            return [f"https://x.com/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(
+                url=url, title="제목",
+                content=("데드바이데이라이트는 4vs1 비대칭 호러 게임입니다. "
+                          "생존자는 발전기 5개를 수리해 탈출해야 합니다. "
+                          "킬러는 후크에 매달아 제거합니다."),
+            )
+
+    # collector 로거에 stream 핸들러를 붙여서 메시지 캡처
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.INFO)
+    target = logging.getLogger("osmu_kr.content_generator.collector")
+    prev_level = target.level
+    target.setLevel(logging.INFO)
+    target.addHandler(handler)
+    try:
+        c = Collector(StubCrawler(), min_sources=3)
+        raw = c.collect("데드바이데이라이트 공략", limit=3)
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(prev_level)
+
+    log_text = buf.getvalue()
+    assert "데드바이데이라이트" in log_text, log_text
+    assert "게임 관련 키워드" in log_text, log_text
+    assert "공략" in log_text, log_text
+    # raw_content 에도 컨텍스트가 살아있어야 한다
+    assert raw.context is not None
+    assert raw.context.inferred_topic == "게임"
+    assert raw.context.domain == "game"
+    assert raw.context.intent_hint == "공략"
+
+
+def test_collector_accepts_keyword_context_directly():
+    """str 뿐 아니라 KeywordContext 도 입력으로 받을 수 있어야 한다(후방호환)."""
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, query, *, limit=5):
+            return [f"https://x.com/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(url=url, title="제목",
+                                content=("적금 추천 글입니다. "
+                                          "금리 비교가 핵심입니다. "
+                                          "우대조건도 살펴봐야 합니다."))
+
+    ctx = KeywordContext.from_keyword("적금 추천")
+    c = Collector(StubCrawler(), min_sources=3)
+    raw = c.collect(ctx, limit=3)
+    assert raw.context is ctx or raw.context.keyword == "적금 추천"
+    assert raw.context.inferred_topic == "재테크/금융"
+    assert raw.context.intent_hint == "추천"
+
+
 TESTS = [
     test_evaluator_deterministic,
     test_expander_includes_seed_and_dedups,
@@ -842,6 +958,12 @@ TESTS = [
     test_generator_full_pipeline_with_stubs,
     test_generator_firecrawl_fallback_to_template,
     test_generator_writer_failure_fallbacks_to_heuristic,
+    # ── [1단계] KeywordContext: 입력 구조 정리 ──
+    test_keyword_context_game_keyword_carries_topic,
+    test_keyword_context_intent_inference,
+    test_keyword_context_coerce_accepts_str_and_passthrough,
+    test_collector_logs_topic_hint_for_game_keyword,
+    test_collector_accepts_keyword_context_directly,
 ]
 
 

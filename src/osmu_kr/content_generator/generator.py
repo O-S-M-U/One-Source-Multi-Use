@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from ..models import ContentRecord, now_utc, to_iso
 from ..storage import build_storage
@@ -37,6 +37,7 @@ from .interfaces import (
     BaseCrawler, BaseImageProvider, BaseWriter,
     GenerationResult, ImageItem,
 )
+from .keyword_context import KeywordContext
 from .keyword_translator import keyword_to_slug
 from .keyword_classifier import profile_for
 from .writer import (
@@ -102,17 +103,24 @@ class Generator:
         self._collector = Collector(self.crawler, min_sources=self.gencfg.n_sources)
 
     # ── 공개 API ─────────────────────────────────
-    def generate(self, keyword: str, *, save: bool = True,
+    def generate(self, keyword: Union[str, KeywordContext], *, save: bool = True,
                  title_final: str = "") -> GenerationResult:
-        kw = (keyword or "").strip()
+        # str / KeywordContext 둘 다 받기 위한 정규화 (1단계)
+        ctx = KeywordContext.coerce(keyword)
+        kw = ctx.keyword
         if not kw:
             raise ValueError("keyword 가 비어 있습니다.")
 
-        log.info("▶ generate(%r) 시작", kw)
+        # 진입 로그 — '키워드 + 게임 관련 키워드' 힌트가 보이는지 확인하기 위함
+        log.info(
+            "▶ generate 시작: keyword='%s' / inferred_topic='%s 관련 키워드' / "
+            "intent_hint='%s' / domain='%s'",
+            ctx.keyword, ctx.inferred_topic, ctx.intent_hint, ctx.domain,
+        )
         slug = keyword_to_slug(kw)
 
-        # ── Step 1: 검색·크롤링 ──
-        raw = self._collector.collect(kw, limit=self.gencfg.n_sources)
+        # ── Step 1: 검색·크롤링 (ctx 그대로 전달 — 컨텍스트 손실 방지) ──
+        raw = self._collector.collect(ctx, limit=self.gencfg.n_sources)
         crawl_error = ""
         if raw.is_empty():
             crawl_error = raw.error or "raw_content_empty"
@@ -123,6 +131,7 @@ class Generator:
                 text=seed_text,
                 char_count=len(seed_text),
                 error=crawl_error,
+                context=ctx,
             )
 
         # ── Step 2: 이미지 (글 생성 직전) ──
