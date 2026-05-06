@@ -35,6 +35,70 @@ STATUS_EXPIRED = "expired"
 STATUS_DEPRECATED = "deprecated"   # 부활 심사 미달
 STATUS_REVIVING = "reviving"       # 재평가 진행 중
 
+# ── v13 키워드 상태 모델 (단순화) ────────────────────────
+# v13 spec: keywords.status 는 active/archived 2단계.
+# 작업 lifecycle (in_progress/published/failed) 은 keyword_usages 테이블이 책임짐.
+KSTATUS_ACTIVE = "active"
+KSTATUS_ARCHIVED = "archived"
+
+NEW_STATUS_SET = {KSTATUS_ACTIVE, KSTATUS_ARCHIVED}
+
+# ── 7-A 호환 알리어스 (deprecated, 점진 제거) ────────────
+# 외부 코드/테스트에서 import 하던 이름들 — 모두 active 또는 archived 로 매핑.
+KSTATUS_CANDIDATE = KSTATUS_ACTIVE
+KSTATUS_INPROGRESS = KSTATUS_ACTIVE       # ★ v13: lifecycle 은 keyword_usages 로
+KSTATUS_PUBLISHED = KSTATUS_ACTIVE        # ★ v13: 발행 사실은 keyword_usages.status
+KSTATUS_FAILED = KSTATUS_ACTIVE           # ★ v13: 실패도 keyword_usages.status
+
+# ── 마이그레이션 매핑 — legacy(v8 이전) + 7-A → v13 ──────
+LEGACY_STATUS_MAP = {
+    STATUS_GOLDEN:     KSTATUS_ACTIVE,
+    STATUS_MEDIUM:     KSTATUS_ACTIVE,
+    STATUS_USED:       KSTATUS_ACTIVE,    # v13: 발행됐어도 keyword 자체는 active
+    STATUS_REJECTED:   KSTATUS_ARCHIVED,
+    STATUS_EXPIRED:    KSTATUS_ARCHIVED,
+    STATUS_DEPRECATED: KSTATUS_ARCHIVED,
+    STATUS_REVIVING:   KSTATUS_ACTIVE,
+    # 7-A 시기에 만들었던 5단계 → 단순화
+    "candidate":  KSTATUS_ACTIVE,
+    "inprogress": KSTATUS_ACTIVE,
+    "published":  KSTATUS_ACTIVE,
+    "failed":     KSTATUS_ACTIVE,
+    "archived":   KSTATUS_ARCHIVED,
+}
+
+
+def normalize_status(status: str) -> str:
+    """status 문자열 → 항상 v13 새 enum (active/archived)."""
+    s = (status or "").strip().lower()
+    if s in NEW_STATUS_SET:
+        return s
+    if s in LEGACY_STATUS_MAP:
+        return LEGACY_STATUS_MAP[s]
+    return KSTATUS_ACTIVE
+
+
+# ── v13 keywords.status 허용 전이 ────────────────────────
+ALLOWED_TRANSITIONS = {
+    KSTATUS_ACTIVE:   {KSTATUS_ARCHIVED},
+    KSTATUS_ARCHIVED: set(),    # 영구 제외 — 전이 없음
+}
+
+
+# ── v13 keyword_usages.status (작업 lifecycle) ──────────
+USAGE_IN_PROGRESS = "in_progress"
+USAGE_PUBLISHED = "published"
+USAGE_FAILED = "failed"
+
+USAGE_STATUS_SET = {USAGE_IN_PROGRESS, USAGE_PUBLISHED, USAGE_FAILED}
+
+# in_progress → (published | failed)  — 한 번 결정되면 다시 못 돌아감
+USAGE_ALLOWED_TRANSITIONS = {
+    USAGE_IN_PROGRESS: {USAGE_PUBLISHED, USAGE_FAILED},
+    USAGE_PUBLISHED:   set(),
+    USAGE_FAILED:      set(),
+}
+
 GRADE_GOLDEN = "황금"
 GRADE_GOOD = "좋은"
 GRADE_MEDIUM = "보통"
@@ -94,6 +158,16 @@ class KeywordPoolItem:
     original_keyword: str = ""      # 알케미 변형의 원본 키워드
     revival_count: int = 0          # 부활 심사 통과 횟수
 
+    # ── 7단계-A 신규 — 안전장치 lifecycle ──
+    # status 는 KSTATUS_* (candidate/inprogress/published/failed/archived) 권장.
+    # legacy(golden/medium/...) 가 들어와도 normalize_status() 가 자동 변환.
+    inprogress_locked_at: str = ""   # candidate→inprogress 전이 시각 (timeout 기준)
+    published_at: str = ""           # inprogress→published 전이 시각 (180일 재진입 기준)
+    failed_at: str = ""              # → failed 전이 시각
+    archived_at: str = ""            # → archived 전이 시각
+    account_id: str = ""             # 멀티 계정 v2 — v1 에선 빈 문자열 = '본인'
+    last_status_reason: str = ""     # 최근 status 전이 사유 (디버깅·감사용)
+
     HEADER = [
         "keyword_id", "seed_keyword", "keyword",
         "search_volume", "competition", "cpc",
@@ -102,6 +176,9 @@ class KeywordPoolItem:
         # 풍부화 필드 — 기존 데이터 후방호환을 위해 끝에 추가
         "grade", "profile", "weak_points",
         "is_alchemy", "original_keyword", "revival_count",
+        # 7단계-A 신규
+        "inprogress_locked_at", "published_at", "failed_at", "archived_at",
+        "account_id", "last_status_reason",
     ]
 
     def to_row(self) -> list:
@@ -121,7 +198,7 @@ class KeywordPoolItem:
             cpc=float(d["cpc"] or 0),
             commercial_intent=float(d["commercial_intent"] or 0),
             score=float(d["score"] or 0),
-            status=str(d["status"] or STATUS_GOLDEN),
+            status=normalize_status(str(d["status"] or KSTATUS_CANDIDATE)),
             created_at=str(d["created_at"] or to_iso(now_utc())),
             updated_at=str(d["updated_at"] or to_iso(now_utc())),
             source=str(d["source"] or "heuristic"),
@@ -132,6 +209,12 @@ class KeywordPoolItem:
             is_alchemy=str(d.get("is_alchemy") or "N"),
             original_keyword=str(d.get("original_keyword") or ""),
             revival_count=int(float(d.get("revival_count") or 0)),
+            inprogress_locked_at=str(d.get("inprogress_locked_at") or ""),
+            published_at=str(d.get("published_at") or ""),
+            failed_at=str(d.get("failed_at") or ""),
+            archived_at=str(d.get("archived_at") or ""),
+            account_id=str(d.get("account_id") or ""),
+            last_status_reason=str(d.get("last_status_reason") or ""),
         )
 
     def fill_grade(self) -> None:

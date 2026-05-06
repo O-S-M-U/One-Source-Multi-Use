@@ -18,7 +18,7 @@ from typing import List, Optional
 
 from ..models import (
     ContentRecord, KeywordPoolItem, ResearchHistoryRecord,
-    now_utc, to_iso,
+    normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
 from .sqlite_schema import open_connection, transaction
@@ -60,7 +60,7 @@ class SqliteStorage(BaseStorage):
             cpc=float(row["cpc"] or 0),
             commercial_intent=float(row["commercial_intent"] or 0),
             score=float(row["score"] or 0),
-            status=row["status"] or "golden",
+            status=normalize_status(row["status"] or "candidate"),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             source=row["source"] or "heuristic",
@@ -71,6 +71,12 @@ class SqliteStorage(BaseStorage):
             is_alchemy=row["is_alchemy"] or "N",
             original_keyword=row["original_keyword"] or "",
             revival_count=int(row["revival_count"] or 0),
+            inprogress_locked_at=row["inprogress_locked_at"] or "",
+            published_at=row["published_at"] or "",
+            failed_at=row["failed_at"] or "",
+            archived_at=row["archived_at"] or "",
+            account_id=row["account_id"] or "",
+            last_status_reason=row["last_status_reason"] or "",
         )
 
     # ── pool ────────────────────────────────────────────
@@ -100,8 +106,14 @@ class SqliteStorage(BaseStorage):
                     keyword_id, keyword, seed_keyword, status, grade, profile,
                     weak_points, is_alchemy, original_keyword, revival_count,
                     score, search_volume, competition, cpc, commercial_intent,
-                    source, note, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source, note,
+                    inprogress_locked_at, published_at, failed_at, archived_at,
+                    account_id, last_status_reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?,
+                          ?, ?)
                 ON CONFLICT(keyword_id) DO UPDATE SET
                     keyword=excluded.keyword,
                     seed_keyword=excluded.seed_keyword,
@@ -119,6 +131,12 @@ class SqliteStorage(BaseStorage):
                     commercial_intent=excluded.commercial_intent,
                     source=excluded.source,
                     note=excluded.note,
+                    inprogress_locked_at=excluded.inprogress_locked_at,
+                    published_at=excluded.published_at,
+                    failed_at=excluded.failed_at,
+                    archived_at=excluded.archived_at,
+                    account_id=excluded.account_id,
+                    last_status_reason=excluded.last_status_reason,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -129,6 +147,9 @@ class SqliteStorage(BaseStorage):
                     item.score, item.search_volume, item.competition, item.cpc,
                     item.commercial_intent,
                     item.source, item.note,
+                    item.inprogress_locked_at, item.published_at,
+                    item.failed_at, item.archived_at,
+                    item.account_id, item.last_status_reason,
                     item.created_at, item.updated_at,
                 ),
             )
@@ -156,8 +177,14 @@ class SqliteStorage(BaseStorage):
                         keyword_id, keyword, seed_keyword, status, grade, profile,
                         weak_points, is_alchemy, original_keyword, revival_count,
                         score, search_volume, competition, cpc, commercial_intent,
-                        source, note, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source, note,
+                        inprogress_locked_at, published_at, failed_at, archived_at,
+                        account_id, last_status_reason,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?,
+                              ?, ?)
                     """,
                     (
                         it.keyword_id, it.keyword, it.seed_keyword,
@@ -167,6 +194,9 @@ class SqliteStorage(BaseStorage):
                         it.score, it.search_volume, it.competition, it.cpc,
                         it.commercial_intent,
                         it.source, it.note,
+                        it.inprogress_locked_at, it.published_at,
+                        it.failed_at, it.archived_at,
+                        it.account_id, it.last_status_reason,
                         it.created_at, it.updated_at,
                     ),
                 )

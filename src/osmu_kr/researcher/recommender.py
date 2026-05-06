@@ -5,7 +5,10 @@ from datetime import timedelta
 from typing import List, Optional
 
 from ..config import Config
-from ..models import ContentRecord, KeywordPoolItem, from_iso, now_utc
+from ..models import (
+    ContentRecord, KeywordPoolItem, KSTATUS_CANDIDATE,
+    from_iso, normalize_status, now_utc,
+)
 from ..storage.base import BaseStorage
 
 
@@ -38,7 +41,9 @@ def recommend(storage: BaseStorage, cfg: Config, top_n: int = 5):
     last = _last_seed(contents) if cfg.avoid_consecutive_topic else None
 
     def is_eligible(item):
-        if item.status != "golden":
+        # 7단계-A: candidate 만 추천 대상. inprogress/published/failed/archived 모두 제외.
+        # legacy 'golden' / 'medium' 도 normalize_status 가 candidate 로 매핑해줌.
+        if normalize_status(item.status) != KSTATUS_CANDIDATE:
             return False
         if item.seed_keyword in blocked:
             return False

@@ -19,7 +19,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..models import (
     ContentRecord, KeywordPoolItem, ResearchHistoryRecord,
-    now_utc, to_iso,
+    normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
 from .postgres_schema import (
@@ -132,7 +132,10 @@ class PostgresStorage(BaseStorage):
         (keyword_id, keyword, seed_keyword, status, grade, profile,
          weak_points, is_alchemy, original_keyword, revival_count,
          score, search_volume, competition, cpc, commercial_intent,
-         source, note, created_at, updated_at) = row
+         source, note,
+         inprogress_locked_at, published_at, failed_at, archived_at,
+         account_id, last_status_reason,
+         created_at, updated_at) = row
         return KeywordPoolItem(
             keyword_id=keyword_id, seed_keyword=seed_keyword, keyword=keyword,
             search_volume=int(search_volume or 0),
@@ -140,7 +143,7 @@ class PostgresStorage(BaseStorage):
             cpc=float(cpc or 0),
             commercial_intent=float(commercial_intent or 0),
             score=float(score or 0),
-            status=status or "golden",
+            status=normalize_status(status or "candidate"),
             created_at=created_at,
             updated_at=updated_at,
             source=source or "heuristic",
@@ -151,13 +154,22 @@ class PostgresStorage(BaseStorage):
             is_alchemy=is_alchemy or "N",
             original_keyword=original_keyword or "",
             revival_count=int(revival_count or 0),
+            inprogress_locked_at=inprogress_locked_at or "",
+            published_at=published_at or "",
+            failed_at=failed_at or "",
+            archived_at=archived_at or "",
+            account_id=account_id or "",
+            last_status_reason=last_status_reason or "",
         )
 
     _POOL_COLS = """
         keyword_id, keyword, seed_keyword, status, grade, profile,
         weak_points, is_alchemy, original_keyword, revival_count,
         score, search_volume, competition, cpc, commercial_intent,
-        source, note, created_at, updated_at
+        source, note,
+        inprogress_locked_at, published_at, failed_at, archived_at,
+        account_id, last_status_reason,
+        created_at, updated_at
     """
 
     def list_pool(self) -> List[KeywordPoolItem]:
@@ -183,7 +195,9 @@ class PostgresStorage(BaseStorage):
                 f"""
                 INSERT INTO keywords ({self._POOL_COLS})
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s)
                 ON CONFLICT (keyword_id) DO UPDATE SET
                     keyword=EXCLUDED.keyword,
                     seed_keyword=EXCLUDED.seed_keyword,
@@ -201,6 +215,12 @@ class PostgresStorage(BaseStorage):
                     commercial_intent=EXCLUDED.commercial_intent,
                     source=EXCLUDED.source,
                     note=EXCLUDED.note,
+                    inprogress_locked_at=EXCLUDED.inprogress_locked_at,
+                    published_at=EXCLUDED.published_at,
+                    failed_at=EXCLUDED.failed_at,
+                    archived_at=EXCLUDED.archived_at,
+                    account_id=EXCLUDED.account_id,
+                    last_status_reason=EXCLUDED.last_status_reason,
                     updated_at=EXCLUDED.updated_at
                 """,
                 (item.keyword_id, item.keyword, item.seed_keyword,
@@ -210,6 +230,9 @@ class PostgresStorage(BaseStorage):
                  item.score, item.search_volume, item.competition,
                  item.cpc, item.commercial_intent,
                  item.source, item.note,
+                 item.inprogress_locked_at, item.published_at,
+                 item.failed_at, item.archived_at,
+                 item.account_id, item.last_status_reason,
                  item.created_at, item.updated_at),
             )
         self.conn.commit()
@@ -233,7 +256,9 @@ class PostgresStorage(BaseStorage):
                 cur.execute(
                     f"INSERT INTO keywords ({self._POOL_COLS}) VALUES "
                     "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    " %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    " %s, %s, %s, %s, %s, %s, %s, "
+                    " %s, %s, %s, %s, %s, %s, "
+                    " %s, %s)",
                     (it.keyword_id, it.keyword, it.seed_keyword,
                      it.status, it.grade, it.profile,
                      it.weak_points, it.is_alchemy, it.original_keyword,
@@ -241,6 +266,9 @@ class PostgresStorage(BaseStorage):
                      it.score, it.search_volume, it.competition,
                      it.cpc, it.commercial_intent,
                      it.source, it.note,
+                     it.inprogress_locked_at, it.published_at,
+                     it.failed_at, it.archived_at,
+                     it.account_id, it.last_status_reason,
                      it.created_at, it.updated_at),
                 )
         self.conn.commit()

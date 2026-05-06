@@ -289,6 +289,16 @@ class KeywordResearcher:
         return recommender.recommend(self.storage, self.cfg, top_n=top_n)
 
     def select_for_content(self, keyword_id, *, original_source="", title_final=""):
+        """선택 → ContentRecord 생성 + 키워드를 inprogress 로 lock.
+
+        7단계-A 변경:
+          · 기존: pool 에서 keyword 를 삭제. → 작업 중단 시 키워드가 영구 잠김.
+          · 신규: SafetyLayer.transition(candidate → inprogress) 으로 lock.
+                  pool 에는 그대로 남되 status=inprogress 로 표시 — recommend()
+                  에서 자동 제외, 작업 완료/실패 시 published/failed 로 전이.
+        """
+        from .safety import SafetyLayer, TransitionError
+
         item = self.storage.get_pool(keyword_id)
         if not item:
             raise KeyError(f"keyword_id={keyword_id}가 pool에 없습니다.")
@@ -300,6 +310,14 @@ class KeywordResearcher:
                 f"seed_cooldown 위반: '{item.seed_keyword}' 는 최근 "
                 f"{self.cfg.seed_cooldown_days}일 내에 사용됨"
             )
+
+        # candidate → inprogress lock
+        safety = SafetyLayer(self.storage)
+        try:
+            safety.to_inprogress(keyword_id, reason=f"select_for_content title={title_final[:50]}")
+        except TransitionError as e:
+            raise PermissionError(f"키워드를 inprogress 로 전환할 수 없습니다: {e}")
+
         record = ContentRecord(
             id=self._next_content_id(),
             keyword=item.keyword,
@@ -312,5 +330,4 @@ class KeywordResearcher:
             note=f"selected from pool (score={item.score})",
         )
         self.storage.append_content(record)
-        self.storage.delete_pool(keyword_id)
         return record

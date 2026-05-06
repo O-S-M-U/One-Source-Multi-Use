@@ -57,14 +57,20 @@ def test_run_seed_creates_pool_items():
     assert rep.expanded > 0
 
 
-def test_select_records_content_and_removes_from_pool():
+def test_select_records_content_and_locks_in_pool():
+    """7단계-A: select 시 pool 에서 삭제하지 않고 inprogress 로 lock."""
+    from osmu_kr.models import KSTATUS_INPROGRESS, normalize_status
     rs = fresh_researcher()
     rs.run_seed("AI ETF")
     pool_before = rs.storage.list_pool()
     pick = pool_before[0]
     rs.select_for_content(pick.keyword_id, title_final="t")
     pool_after = rs.storage.list_pool()
-    assert pick.keyword_id not in {it.keyword_id for it in pool_after}
+    # 키워드는 풀에 그대로 남되 status=inprogress
+    found = [it for it in pool_after if it.keyword_id == pick.keyword_id]
+    assert len(found) == 1
+    assert normalize_status(found[0].status) == KSTATUS_INPROGRESS
+    assert found[0].inprogress_locked_at  # lock 타임스탬프 기록됨
     contents = rs.storage.list_content()
     assert any(r.keyword_id == pick.keyword_id for r in contents)
 
@@ -1828,6 +1834,133 @@ def test_postgres_storage_round_trip_when_db_available():
     s.close()
 
 
+# ────────────────────────────────────────────────────────
+# [7단계-A] 키워드 상태 모델 재정의 + SafetyLayer
+# ────────────────────────────────────────────────────────
+
+def test_normalize_status_maps_legacy_to_new():
+    from osmu_kr.models import (
+        normalize_status, KSTATUS_CANDIDATE, KSTATUS_PUBLISHED, KSTATUS_ARCHIVED,
+    )
+    assert normalize_status("golden") == KSTATUS_CANDIDATE
+    assert normalize_status("medium") == KSTATUS_CANDIDATE
+    assert normalize_status("reviving") == KSTATUS_CANDIDATE
+    assert normalize_status("used") == KSTATUS_PUBLISHED
+    assert normalize_status("rejected") == KSTATUS_ARCHIVED
+    assert normalize_status("expired") == KSTATUS_ARCHIVED
+    assert normalize_status("deprecated") == KSTATUS_ARCHIVED
+    # 새 값은 그대로
+    assert normalize_status("candidate") == "candidate"
+    assert normalize_status("inprogress") == "inprogress"
+    # 알 수 없는 값 → candidate
+    assert normalize_status("zzz") == "candidate"
+
+
+def test_safety_layer_transition_happy_path():
+    """candidate → inprogress → published 정상 흐름."""
+    from osmu_kr.models import (
+        KSTATUS_CANDIDATE, KSTATUS_INPROGRESS, KSTATUS_PUBLISHED,
+        KeywordPoolItem,
+    )
+    from osmu_kr.researcher.safety import SafetyLayer
+
+    rs = fresh_researcher()
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="0001", seed_keyword="x", keyword="테스트 키워드",
+        status=KSTATUS_CANDIDATE,
+    ))
+    safety = SafetyLayer(rs.storage)
+
+    after_lock = safety.to_inprogress("0001", reason="test")
+    assert after_lock.status == KSTATUS_INPROGRESS
+    assert after_lock.inprogress_locked_at
+    assert "test" in after_lock.last_status_reason
+
+    after_pub = safety.to_published("0001", reason="ok")
+    assert after_pub.status == KSTATUS_PUBLISHED
+    assert after_pub.published_at
+    assert after_pub.inprogress_locked_at == ""   # lock 자동 해제
+
+
+def test_safety_layer_rejects_illegal_transition():
+    """archived 는 어디로도 못 감 (영구 제외)."""
+    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
+    from osmu_kr.researcher.safety import SafetyLayer, TransitionError
+
+    rs = fresh_researcher()
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="0002", seed_keyword="x", keyword="아카이브 후보",
+        status=KSTATUS_CANDIDATE,
+    ))
+    safety = SafetyLayer(rs.storage)
+    safety.to_archived("0002", reason="test")
+
+    try:
+        safety.to_candidate("0002", reason="re-enter")
+        assert False, "TransitionError 가 나야 함"
+    except TransitionError as e:
+        assert "archived" in str(e)
+
+
+def test_safety_layer_self_transition_is_noop():
+    """같은 status 로의 전이는 멱등 (no-op)."""
+    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
+    from osmu_kr.researcher.safety import SafetyLayer
+
+    rs = fresh_researcher()
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="0003", seed_keyword="x", keyword="self trans",
+        status=KSTATUS_CANDIDATE,
+    ))
+    safety = SafetyLayer(rs.storage)
+    item = safety.to_candidate("0003", reason="noop")
+    assert item.status == KSTATUS_CANDIDATE
+
+
+def test_recommend_only_returns_candidates_not_inprogress():
+    """7-A: recommend 가 inprogress / published / archived 를 자동 제외."""
+    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
+    from osmu_kr.researcher.safety import SafetyLayer
+
+    rs = fresh_researcher()
+    rs.run_seed("AI ETF")
+    pool = rs.storage.list_pool()
+    assert len(pool) >= 2
+    # 첫 키워드를 inprogress 로 lock
+    safety = SafetyLayer(rs.storage)
+    safety.to_inprogress(pool[0].keyword_id, reason="lock_test")
+
+    recs = rs.recommend(top_n=10)
+    rec_ids = {r.keyword_id for r in recs}
+    assert pool[0].keyword_id not in rec_ids   # inprogress 는 추천에서 제외
+
+
+def test_keyword_pool_item_lifecycle_fields_persist_in_sqlite():
+    """7-A 신규 lifecycle 필드가 SQLite 라운드트립에서 보존되는지."""
+    import os, tempfile
+    from osmu_kr.models import (
+        KSTATUS_PUBLISHED, KeywordPoolItem,
+    )
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_lifecycle_"), "x.db")
+    s = SqliteStorage(db_path=db)
+
+    s.upsert_pool(KeywordPoolItem(
+        keyword_id="0010", seed_keyword="x", keyword="lifecycle",
+        status=KSTATUS_PUBLISHED,
+        inprogress_locked_at="", published_at="2026-05-06T10:00:00+0000",
+        failed_at="", archived_at="", account_id="acct-1",
+        last_status_reason="auto-publish ok",
+    ))
+    loaded = s.get_pool("0010")
+    assert loaded.status == KSTATUS_PUBLISHED
+    assert loaded.published_at == "2026-05-06T10:00:00+0000"
+    assert loaded.account_id == "acct-1"
+    assert "auto-publish" in loaded.last_status_reason
+    s.close()
+
+
 def test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back():
     """LLM 이 일반 템플릿(개념/활용/결론) 을 만들어도 phase1 이 reject 하고 룰 폴백."""
     import os
@@ -1914,7 +2047,7 @@ TESTS = [
     test_expander_includes_seed_and_dedups,
     test_alchemy_produces_distinct_variants,
     test_run_seed_creates_pool_items,
-    test_select_records_content_and_removes_from_pool,
+    test_select_records_content_and_locks_in_pool,
     test_seed_cooldown_blocks_same_seed,
     test_prune_removes_expired,
     test_xlsx_storage_round_trip,
@@ -1992,6 +2125,13 @@ TESTS = [
     test_postgres_storage_imports_without_db_url,
     test_postgres_factory_raises_without_url,
     test_postgres_storage_round_trip_when_db_available,
+    # ── [7단계-A] 키워드 상태 모델 + SafetyLayer ──
+    test_normalize_status_maps_legacy_to_new,
+    test_safety_layer_transition_happy_path,
+    test_safety_layer_rejects_illegal_transition,
+    test_safety_layer_self_transition_is_noop,
+    test_recommend_only_returns_candidates_not_inprogress,
+    test_keyword_pool_item_lifecycle_fields_persist_in_sqlite,
 ]
 
 
