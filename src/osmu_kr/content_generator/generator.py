@@ -32,12 +32,14 @@ from ..config import Config
 
 from .collector import Collector, RawContent
 from .firecrawl_client import FirecrawlClient
+from .phase2 import Phase2Collector, Phase2Config, Phase2Result
 from .images import ChainedImageProvider, PicsumImageProvider, UnsplashImageProvider
 from .interfaces import (
     BaseCrawler, BaseImageProvider, BaseWriter,
     GenerationResult, ImageItem,
 )
 from .keyword_context import KeywordContext
+from .interpreter import interpret as _interpret_keyword
 from .keyword_translator import keyword_to_slug
 from .keyword_classifier import profile_for
 from .writer import (
@@ -105,19 +107,39 @@ class Generator:
     # ── 공개 API ─────────────────────────────────
     def generate(self, keyword: Union[str, KeywordContext], *, save: bool = True,
                  title_final: str = "") -> GenerationResult:
-        # str / KeywordContext 둘 다 받기 위한 정규화 (1단계)
-        ctx = KeywordContext.coerce(keyword)
+        # 0단계 — interpret() 가 룰 + (옵션)LLM 으로 KeywordContext 채워준다.
+        # 이미 KeywordContext 면 그대로 사용 (passthrough), str 이면 정규화.
+        ctx = _interpret_keyword(keyword)
         kw = ctx.keyword
         if not kw:
             raise ValueError("keyword 가 비어 있습니다.")
 
-        # 진입 로그 — '키워드 + 게임 관련 키워드' 힌트가 보이는지 확인하기 위함
+        # 진입 로그 — '키워드 + 게임 관련 키워드' 힌트 + 한 줄 요약까지 출력
         log.info(
             "▶ generate 시작: keyword='%s' / inferred_topic='%s 관련 키워드' / "
-            "intent_hint='%s' / domain='%s'",
+            "intent_hint='%s' / domain='%s' / src=%s / topic_summary='%s'",
             ctx.keyword, ctx.inferred_topic, ctx.intent_hint, ctx.domain,
+            ctx.source, ctx.topic_summary,
         )
         slug = keyword_to_slug(kw)
+
+        # ── Phase 1: 청사진 + 임베딩 + commercial (3·4단계, in-memory) ──
+        try:
+            blueprint = self._collector.phase1(ctx)
+            log.info("[generator] phase1 청사진: %s", blueprint.short())
+        except Exception as e:
+            log.warning("[generator] phase1 실패(무시하고 계속): %s", e)
+            blueprint = None
+
+        # ── Phase 2: fact_based 단락별 normalized_sources (4단계) ──
+        phase2_result: Optional[Phase2Result] = None
+        if blueprint is not None:
+            try:
+                ph2 = Phase2Collector(self.crawler)
+                phase2_result = ph2.run(blueprint, domain=ctx.domain)
+                log.info("[generator] phase2: %s", phase2_result.short())
+            except Exception as e:
+                log.warning("[generator] phase2 실패(무시하고 계속): %s", e)
 
         # ── Step 1: 검색·크롤링 (ctx 그대로 전달 — 컨텍스트 손실 방지) ──
         raw = self._collector.collect(ctx, limit=self.gencfg.n_sources)

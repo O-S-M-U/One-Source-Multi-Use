@@ -1,4 +1,4 @@
-"""KeywordContext — collector 입력 구조 (1단계).
+"""KeywordContext — 0단계 keyword 정규화 산출물 (1·2단계).
 
 [ 왜 필요한가 ]
 지금까지 keyword 가 단순 str 로 모듈 사이를 흘러다녔다. 그러다 보니
@@ -6,15 +6,19 @@
 중간에서 사라지고, LLM 이 일반 비즈니스 도입 가이드 같은 결과를 냈다.
 
 이 모듈은 그 출발점을 막는다 — keyword 를 모듈 경계 너머로 넘길 때 항상
-{keyword + inferred_topic + intent_hint} 묶음으로 감싸서 전달.
+{keyword + inferred_topic + intent_hint + topic_summary} 묶음으로 감싸서 전달.
 
-[ 자동 추론 — 룰 기반 ]
+[ 자동 추론 — 룰 기반 (1단계) ]
 - inferred_topic: keyword_classifier.profile_for() 의 한국어 라벨 그대로
-  · 게임 / 재테크·금융 / 다이어트·건강 / IT·디지털 / 뷰티 / 여행 / 음식 / 일반
+  · 게임 / 재테크/금융 / 다이어트/건강 / IT/디지털 / 뷰티/화장품 / 여행 / 음식/요리 / 일반
 - intent_hint:  키워드에 포함된 의도 단어로 추출
-  · 공략 / 추천 / 비교 / 리뷰 / 구매 / 방법 / 순위 / 정보(default)
+  · 공략 / 추천 / 비교 / 리뷰 / 구매 / 방법 / 순위 / 팁 / 정보(default)
 
-LLM 호출 없이 룰만으로 90% 이상 잡힌다. 모자라면 향후 LLM 보조 추론을 추가.
+[ 한 줄 요약 — topic_summary (2단계) ]
+- 룰 기반: domain 라벨 + intent + 키워드 본문을 조합해 한 문장 자동 생성
+  예) "‘데드바이데이라이트 공략’은 게임 도메인의 공략 의도 키워드입니다."
+- LLM 보강: interpreter.interpret(use_llm=True) 가 Anthropic 호출로 덮어쓰기.
+  키 없거나 호출 실패 → 룰 결과 fallback. (interpreter.py 참조)
 """
 from __future__ import annotations
 
@@ -67,6 +71,27 @@ def infer_intent(keyword: str) -> str:
     return "정보"
 
 
+def rule_topic_summary(keyword: str, inferred_topic: str, intent_hint: str) -> str:
+    """LLM 호출 없이 만드는 한 줄 요약(룰 기반).
+
+    구조: '‘<keyword>’는 <도메인> 도메인의 <intent> 의도 키워드입니다.'
+    예)
+      · ‘데드바이데이라이트 공략’은 게임 도메인의 공략 의도 키워드입니다.
+      · ‘적금 추천’은 재테크/금융 도메인의 추천 의도 키워드입니다.
+      · ‘스텔라 블레이드 빌드’는 일반 도메인의 정보 의도 키워드입니다. (미등재 — LLM 보강 권장)
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return ""
+    topic = inferred_topic or "일반"
+    intent = intent_hint or "정보"
+    base = f"‘{kw}’는 {topic} 도메인의 {intent} 의도 키워드입니다."
+    if topic == "일반":
+        # 도메인 미식별 시 LLM 보강이 필요하다는 신호를 함께 남김
+        base += " (도메인 미식별 — LLM 보강 권장)"
+    return base
+
+
 @dataclass
 class KeywordContext:
     """collector 로 넘기는 키워드 컨텍스트.
@@ -76,32 +101,41 @@ class KeywordContext:
       · inferred_topic  : 도메인 한글 라벨 (예: '게임')
       · intent_hint     : 추론된 의도 한글 라벨 (예: '공략', '추천')
       · domain          : 도메인 영문 코드 (예: 'game')
-      · raw_signals     : 추가 메타 (LLM 추론 점수 등 향후 확장)
+      · topic_summary   : 한 줄 요약 — 룰 또는 LLM 결과 (2단계 신규)
+      · source          : 'rule' | 'llm' | 'llm_fallback_rule' — 어떻게 채워졌는지
+      · raw_signals     : 추가 메타 (LLM 추론 점수, 원본 응답 일부 등 향후 확장)
 
     str 와 KeywordContext 둘 다 받는 함수에서 한 줄로 정규화하기 위한
-    classmethod `coerce()` 가 핵심 진입점이다.
+    classmethod `coerce()` 가 핵심 진입점이다 (룰 기반).
+    LLM 보강은 별도로 interpreter.interpret() 를 호출.
     """
     keyword: str
     inferred_topic: str
     intent_hint: str
     domain: str = ""
+    topic_summary: str = ""
+    source: str = "rule"
     raw_signals: Dict[str, str] = field(default_factory=dict)
 
     # ── 생성 ────────────────────────────────────────
     @classmethod
     def from_keyword(cls, keyword: str) -> "KeywordContext":
-        """keyword 단독으로부터 자동 추론 컨텍스트 생성."""
+        """keyword 단독으로부터 자동 추론 컨텍스트 생성 (룰만, LLM 호출 없음)."""
         kw = (keyword or "").strip()
         if not kw:
             return cls(keyword="", inferred_topic="일반", intent_hint="정보",
-                        domain=Domain.GENERAL.value)
+                        domain=Domain.GENERAL.value, topic_summary="",
+                        source="rule")
         profile = profile_for(kw)
         intent = infer_intent(kw)
+        topic = profile.name_ko
         return cls(
             keyword=kw,
-            inferred_topic=profile.name_ko,
+            inferred_topic=topic,
             intent_hint=intent,
             domain=profile.domain.value,
+            topic_summary=rule_topic_summary(kw, topic, intent),
+            source="rule",
         )
 
     @classmethod
@@ -121,10 +155,13 @@ class KeywordContext:
             "inferred_topic": self.inferred_topic,
             "intent_hint": self.intent_hint,
             "domain": self.domain,
+            "topic_summary": self.topic_summary,
+            "source": self.source,
         }
 
     def short(self) -> str:
         """짧은 한 줄 요약 — 로그 헤더에 적합."""
         return (f"keyword='{self.keyword}' "
                 f"topic={self.inferred_topic}({self.domain}) "
-                f"intent={self.intent_hint}")
+                f"intent={self.intent_hint} "
+                f"src={self.source}")

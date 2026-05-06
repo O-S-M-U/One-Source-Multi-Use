@@ -917,6 +917,663 @@ def test_collector_accepts_keyword_context_directly():
     assert raw.context.intent_hint == "추천"
 
 
+# ────────────────────────────────────────────────────────
+# [2단계] interpreter — 0단계 keyword 정규화 (룰 + LLM 보강)
+# ────────────────────────────────────────────────────────
+
+def test_keyword_context_topic_summary_filled_by_rule():
+    """from_keyword 만으로도 topic_summary 가 채워져야 한다."""
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    a = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    assert a.topic_summary
+    assert "게임" in a.topic_summary
+    assert "공략" in a.topic_summary
+    assert a.source == "rule"
+
+    # 진짜 미등재 — 어떤 도메인 단어도 안 걸리는 키워드
+    b = KeywordContext.from_keyword("오리지널 한정판 굿즈")
+    assert b.inferred_topic == "일반", f"unexpected topic: {b.inferred_topic}"
+    assert b.topic_summary
+    assert "일반" in b.topic_summary
+    # 도메인 미식별 신호가 한 줄 요약에 함께 있어야 한다 (LLM 보강 권장)
+    assert "LLM" in b.topic_summary or "보강" in b.topic_summary
+
+
+def test_interpreter_rule_only_when_use_llm_false():
+    """use_llm=False 면 LLM 호출 없이 룰만 — source='rule'."""
+    from osmu_kr.content_generator.interpreter import interpret
+
+    ctx = interpret("데드바이데이라이트 공략", use_llm=False)
+    assert ctx.domain == "game"
+    assert ctx.intent_hint == "공략"
+    assert ctx.source == "rule"
+
+
+def test_interpreter_llm_fallback_when_no_api_key(monkeypatch=None):
+    """use_llm=True 라도 키 없으면 룰 결과 + source='llm_fallback_rule'."""
+    import os
+    from osmu_kr.content_generator.interpreter import interpret
+
+    saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        ctx = interpret("적금 추천", use_llm=True)
+    finally:
+        if saved is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved
+
+    assert ctx.domain == "finance"            # 룰이 잡아낸 결과
+    assert ctx.intent_hint == "추천"
+    assert ctx.source == "llm_fallback_rule"
+    assert ctx.raw_signals.get("llm_skip") == "no_api_key"
+
+
+def test_interpreter_llm_overrides_when_call_succeeds():
+    """LLM 응답이 정상이면 domain/intent/topic_summary 가 덮어써져야 한다.
+
+    실제 Anthropic 호출 대신 _post_anthropic 을 stub 으로 교체해 테스트한다.
+    미등재 키워드(‘스텔라 블레이드 빌드’) → 룰은 general 이지만 LLM 이 game 으로 보정.
+    """
+    import os
+    from osmu_kr.content_generator import interpreter as itp
+
+    fake_response = (
+        '{"domain": "game", "intent": "공략", '
+        '"topic_summary": "스텔라 블레이드 캐릭터 빌드/스킬 셋업을 찾는 게임 키워드"}'
+    )
+    saved_post = itp._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test_key_anything"
+
+    def stub_post(api_key, model, system, user, **_kw):
+        assert "스텔라 블레이드" in user
+        return fake_response
+
+    itp._post_anthropic = stub_post
+    try:
+        ctx = itp.interpret("스텔라 블레이드 빌드", use_llm=True)
+    finally:
+        itp._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    assert ctx.domain == "game"
+    assert ctx.inferred_topic == "게임"
+    assert ctx.intent_hint == "공략"
+    assert "스텔라 블레이드" in ctx.topic_summary
+    assert ctx.source == "llm"
+    assert ctx.raw_signals.get("llm_model")
+
+
+def test_interpreter_llm_failure_falls_back_to_rule():
+    """LLM 호출이 예외/잘못된 JSON 이면 룰 결과로 폴백해야 한다."""
+    import os
+    from osmu_kr.content_generator import interpreter as itp
+
+    saved_post = itp._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test_key_bad"
+
+    def stub_post(*_a, **_kw):
+        raise RuntimeError("Anthropic HTTP 500: simulated")
+
+    itp._post_anthropic = stub_post
+    try:
+        ctx = itp.interpret("아이폰 vs 갤럭시 비교", use_llm=True)
+    finally:
+        itp._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    assert ctx.domain == "it"             # 룰이 잡은 결과 보존
+    assert ctx.intent_hint == "비교"
+    assert ctx.source == "llm_fallback_rule"
+    assert "call_failed" in ctx.raw_signals.get("llm_skip", "")
+
+
+def test_interpreter_passthrough_when_already_context():
+    """이미 KeywordContext 면 그대로 통과 (불필요 LLM 호출 없음)."""
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.content_generator.interpreter import interpret
+
+    ctx_in = KeywordContext.from_keyword("다이어트 후기")
+    ctx_out = interpret(ctx_in, use_llm=True)
+    assert ctx_out is ctx_in
+
+
+# ────────────────────────────────────────────────────────
+# [3단계] collector Phase 1 — Blueprint + 검증 + summary_embedding
+# ────────────────────────────────────────────────────────
+
+def test_blueprint_rule_mode_basic_shape():
+    """룰 모드만으로도 Phase 1 산출물 4종이 채워져야 한다."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    bp = generate_blueprint(ctx, use_llm=False)
+
+    assert bp.title
+    assert bp.target_reader.primary_intent == "공략"
+    assert bp.target_reader.knowledge_level in {"초보", "중급", "전문가"}
+    assert len(bp.paragraphs) >= 3
+    # 첫·마지막 단락은 llm_generated 강제
+    assert bp.paragraphs[0].paragraph_type == "llm_generated"
+    assert bp.paragraphs[-1].paragraph_type == "llm_generated"
+    # 가운데 단락은 fact_based 가 적어도 1개
+    assert any(p.paragraph_type == "fact_based" for p in bp.paragraphs[1:-1])
+    assert bp.intro and bp.short_conclusion
+    assert bp.source == "rule"
+
+
+def test_blueprint_llm_overrides_when_call_succeeds():
+    """LLM 응답 정상이면 title/target_reader/paragraphs 가 전부 덮어써져야 한다."""
+    import os
+    from osmu_kr.content_generator import blueprint as bp_mod
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    fake = (
+        '{"title": "데드바이데이라이트 초보 입문 — 첫 매칭 전 필수 팁",'
+        ' "target_reader": {"persona": "처음 DBD를 시작하는 직장인 게이머",'
+        '   "knowledge_level": "초보", "primary_intent": "공략"},'
+        ' "paragraphs": ['
+        '   {"section_index": 1, "title": "DBD 가 어떤 게임인지 빠르게 정리",'
+        '    "paragraph_type": "llm_generated", "description": "장르·규칙·승리 조건"},'
+        '   {"section_index": 2, "title": "생존자 캐릭터 추천 3종",'
+        '    "paragraph_type": "fact_based", "description": "초보용 캐릭터 비교",'
+        '    "facts_required": ["메그", "드와이트", "클로뎃"]},'
+        '   {"section_index": 3, "title": "초보가 자주 죽는 4가지 실수",'
+        '    "paragraph_type": "fact_based", "description": "회피법까지",'
+        '    "facts_required": ["발전기 본딩", "후크 매달림"]},'
+        '   {"section_index": 4, "title": "다음에 시도할 콘텐츠",'
+        '    "paragraph_type": "llm_generated", "description": "다음 행동 가이드"}'
+        ' ],'
+        ' "intro": "DBD 첫 진입 직장인을 위한 필수 가이드.",'
+        ' "short_conclusion": "초보 핵심 4가지를 정리한 입문 가이드입니다."}'
+    )
+    saved_post = bp_mod._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test"
+    bp_mod._post_anthropic = lambda *a, **kw: fake
+    try:
+        ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+        bp = bp_mod.generate_blueprint(ctx, use_llm=True)
+    finally:
+        bp_mod._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    assert bp.source == "llm"
+    assert "DBD" in bp.title or "데드바이데이라이트" in bp.title
+    assert bp.target_reader.knowledge_level == "초보"
+    assert len(bp.paragraphs) == 4
+    fact_titles = [p.title for p in bp.paragraphs if p.paragraph_type == "fact_based"]
+    assert len(fact_titles) == 2
+
+
+def test_blueprint_llm_failure_falls_back_to_rule():
+    """Anthropic 호출 예외 시 룰 결과로 폴백해야 한다."""
+    import os
+    from osmu_kr.content_generator import blueprint as bp_mod
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    saved_post = bp_mod._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test"
+    def boom(*a, **kw):
+        raise RuntimeError("Anthropic HTTP 500")
+    bp_mod._post_anthropic = boom
+    try:
+        ctx = KeywordContext.from_keyword("적금 추천")
+        bp = bp_mod.generate_blueprint(ctx, use_llm=True)
+    finally:
+        bp_mod._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    assert bp.source == "llm_fallback_rule"
+    assert "call_failed" in bp.raw_signals.get("llm_skip", "")
+    assert bp.target_reader.primary_intent == "추천"
+
+
+def test_blueprint_validator_rejects_generic_template():
+    """‘개념 → 활용 → 결론’ 류 일반 템플릿은 reject."""
+    from osmu_kr.content_generator.blueprint import (
+        BlueprintResult, ParagraphBlock, TargetReader,
+    )
+    from osmu_kr.content_generator.blueprint_validator import validate_blueprint
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    bad = BlueprintResult(
+        keyword=ctx.keyword,
+        title="데드바이데이라이트",
+        target_reader=TargetReader(persona="x", knowledge_level="초보",
+                                    primary_intent="공략"),
+        paragraphs=[
+            ParagraphBlock(1, "개념", "llm_generated", "x"),
+            ParagraphBlock(2, "활용", "fact_based", "x"),
+            ParagraphBlock(3, "결론", "llm_generated", "x"),
+        ],
+        intro="x",
+        short_conclusion="x",
+    )
+    issues = validate_blueprint(bad, ctx)
+    assert issues
+    assert any("generic" in i for i in issues), issues
+
+
+def test_blueprint_validator_accepts_concrete_template():
+    """구체적 단락 제목 + fact_based 분포 + commercial 채워짐 → 통과."""
+    from osmu_kr.content_generator.blueprint import (
+        BlueprintResult, CommercialElements, ParagraphBlock, TargetReader,
+    )
+    from osmu_kr.content_generator.blueprint_validator import validate_blueprint
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    good = BlueprintResult(
+        keyword=ctx.keyword,
+        title="데드바이데이라이트 초보 공략",
+        target_reader=TargetReader(persona="x", knowledge_level="초보",
+                                    primary_intent="공략"),
+        paragraphs=[
+            ParagraphBlock(1, "DBD 가 어떤 게임인지 1분 요약",
+                           "llm_generated", "장르·규칙"),
+            ParagraphBlock(2, "초보 추천 생존자 3명 비교",
+                           "fact_based", "메그/드와이트/클로뎃"),
+            ParagraphBlock(3, "공략 핵심 — 발전기 본딩 회피법",
+                           "fact_based", "발전기 동선"),
+            ParagraphBlock(4, "다음 단계로 시도할 콘텐츠",
+                           "llm_generated", "다음 행동"),
+        ],
+        intro="x", short_conclusion="x",
+        commercial_elements=CommercialElements(
+            recommendations=["메그 빌드", "드와이트 빌드"],
+            comparison_points=["캐릭터별 강점"],
+            cta_candidates=["빌드 더 보기", "초보 영상"],
+        ),
+    )
+    assert validate_blueprint(good, ctx) == []
+
+
+def test_stub_embedder_deterministic_and_dim():
+    """StubEmbedder 는 같은 입력에 같은 벡터, 차원=768."""
+    from osmu_kr.content_generator.embedder import StubEmbedder, cosine
+
+    e = StubEmbedder()
+    a = e.encode("데드바이데이라이트 초보 공략")
+    b = e.encode("데드바이데이라이트 초보 공략")
+    c = e.encode("적금 추천 비교")
+    assert len(a) == 768 == e.dim
+    assert a == b
+    assert cosine(a, a) > 0.99
+    # 다른 입력은 cosine < 1
+    assert cosine(a, c) < 0.99
+
+
+def test_zero_embedder_returns_none():
+    from osmu_kr.content_generator.embedder import ZeroEmbedder
+
+    z = ZeroEmbedder()
+    assert z.encode("아무 텍스트") is None
+    assert z.dim == 0
+
+
+def test_build_embedder_respects_env(monkeypatch=None):
+    """OSMU_EMBEDDER=stub → StubEmbedder, =disabled → ZeroEmbedder."""
+    import os
+    from osmu_kr.content_generator.embedder import (
+        build_embedder, StubEmbedder, ZeroEmbedder,
+    )
+    saved = os.environ.get("OSMU_EMBEDDER")
+    try:
+        os.environ["OSMU_EMBEDDER"] = "stub"
+        assert isinstance(build_embedder(), StubEmbedder)
+        os.environ["OSMU_EMBEDDER"] = "disabled"
+        assert isinstance(build_embedder(), ZeroEmbedder)
+    finally:
+        if saved is None:
+            os.environ.pop("OSMU_EMBEDDER", None)
+        else:
+            os.environ["OSMU_EMBEDDER"] = saved
+
+
+def test_collector_phase1_full_with_stub_embedder():
+    """phase1: blueprint(룰) + summary_embedding(stub) 통합."""
+    import os
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.embedder import StubEmbedder
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, q, *, limit=5): return []
+        def scrape(self, url): return CrawledPage(url=url, title="t", content="c")
+
+    saved_use = os.environ.pop("OSMU_USE_LLM_BLUEPRINT", None)
+    try:
+        c = Collector(StubCrawler(), embedder=StubEmbedder())
+        ctx = KeywordContext.from_keyword("적금 추천")
+        bp = c.phase1(ctx)
+    finally:
+        if saved_use is not None:
+            os.environ["OSMU_USE_LLM_BLUEPRINT"] = saved_use
+
+    assert bp.keyword == "적금 추천"
+    assert bp.title
+    assert bp.target_reader.primary_intent == "추천"
+    assert len(bp.paragraphs) >= 3
+    assert isinstance(bp.summary_embedding, list)
+    assert len(bp.summary_embedding) == 768
+    assert bp.raw_signals.get("embedder") == "stub"
+
+
+# ────────────────────────────────────────────────────────
+# [4단계] Commercial Elements + Phase 2 fact 매핑
+# ────────────────────────────────────────────────────────
+
+def test_blueprint_rule_mode_includes_commercial_elements():
+    """룰 모드에서도 commercial_elements 가 도메인별 폴백으로 채워져야 한다."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    bp = generate_blueprint(KeywordContext.from_keyword("적금 추천"), use_llm=False)
+    ce = bp.commercial_elements
+    assert len(ce.recommendations) >= 2, ce.recommendations
+    assert len(ce.comparison_points) >= 2, ce.comparison_points
+    assert len(ce.cta_candidates) >= 2, ce.cta_candidates
+    # finance 도메인 폴백 — 비교 포인트에 ‘수익률’ 류 단어가 있어야 함
+    assert any("수익률" in s or "수수료" in s for s in ce.comparison_points)
+
+
+def test_blueprint_llm_response_with_commercial_elements():
+    """LLM 응답에 commercial_elements 가 들어오면 그대로 반영."""
+    import os
+    from osmu_kr.content_generator import blueprint as bp_mod
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    fake = (
+        '{"title": "DBD 초보 첫 매칭 가이드",'
+        ' "target_reader": {"persona": "초보 게이머", "knowledge_level": "초보", "primary_intent": "공략"},'
+        ' "paragraphs": ['
+        '   {"section_index": 1, "title": "DBD 가 어떤 게임인지 정리", "paragraph_type": "llm_generated", "description": "장르"},'
+        '   {"section_index": 2, "title": "초보 추천 캐릭터 비교", "paragraph_type": "fact_based", "description": "비교", "facts_required": ["메그", "드와이트"]},'
+        '   {"section_index": 3, "title": "초보 자주 죽는 실수", "paragraph_type": "fact_based", "description": "실수"},'
+        '   {"section_index": 4, "title": "다음 도전할 콘텐츠", "paragraph_type": "llm_generated", "description": "다음"}'
+        ' ],'
+        ' "intro": "DBD 첫 매칭 가이드.",'
+        ' "short_conclusion": "초보용 핵심 4가지 정리.",'
+        ' "commercial_elements": {'
+        '   "recommendations": ["메그 토마스", "드와이트 페어필드", "초보 빌드 4종"],'
+        '   "comparison_points": ["생존자 캐릭터 강점", "맵 별 동선"],'
+        '   "cta_candidates": ["추천 빌드 더 보기", "초보 영상 가이드"]'
+        ' }}'
+    )
+    saved_post = bp_mod._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "test"
+    bp_mod._post_anthropic = lambda *a, **kw: fake
+    try:
+        bp = bp_mod.generate_blueprint(
+            KeywordContext.from_keyword("데드바이데이라이트 공략"), use_llm=True,
+        )
+    finally:
+        bp_mod._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
+    ce = bp.commercial_elements
+    assert "메그 토마스" in ce.recommendations
+    assert any("강점" in s for s in ce.comparison_points)
+    assert any("빌드" in s for s in ce.cta_candidates)
+
+
+def test_phase1_autofills_commercial_when_llm_omits_them():
+    """LLM 이 commercial 누락한 응답이어도 phase1 이 룰 폴백으로 보강."""
+    import os
+    from osmu_kr.content_generator import blueprint as bp_mod
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.embedder import StubEmbedder
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, q, *, limit=5): return []
+        def scrape(self, url): return CrawledPage(url=url, title="t", content="c")
+
+    fake = (
+        '{"title": "적금 추천 — 직장인용 비교",'
+        ' "target_reader": {"persona": "직장인 초보", "knowledge_level": "초보", "primary_intent": "추천"},'
+        ' "paragraphs": ['
+        '   {"section_index": 1, "title": "적금 추천 글이 다룰 범위 정리", "paragraph_type": "llm_generated", "description": "범위"},'
+        '   {"section_index": 2, "title": "수익률 상위 적금 3종 비교", "paragraph_type": "fact_based", "description": "수익률 비교"},'
+        '   {"section_index": 3, "title": "수수료·우대조건 체크포인트", "paragraph_type": "fact_based", "description": "수수료"},'
+        '   {"section_index": 4, "title": "지속할 만한 추천 전략", "paragraph_type": "llm_generated", "description": "전략"}'
+        ' ],'
+        ' "intro": "직장인 적금 비교 가이드.",'
+        ' "short_conclusion": "추천 적금 3종 비교 정리."'
+        '}'
+    )
+    saved_post = bp_mod._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    saved_use = os.environ.get("OSMU_USE_LLM_BLUEPRINT")
+    os.environ["ANTHROPIC_API_KEY"] = "test"
+    os.environ["OSMU_USE_LLM_BLUEPRINT"] = "1"
+    bp_mod._post_anthropic = lambda *a, **kw: fake
+    try:
+        c = Collector(StubCrawler(), embedder=StubEmbedder())
+        bp = c.phase1(KeywordContext.from_keyword("적금 추천"))
+    finally:
+        bp_mod._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+        if saved_use is None:
+            os.environ.pop("OSMU_USE_LLM_BLUEPRINT", None)
+        else:
+            os.environ["OSMU_USE_LLM_BLUEPRINT"] = saved_use
+
+    # paragraphs 는 LLM 결과 유지 (구조 OK)
+    assert len(bp.paragraphs) == 4
+    assert "적금" in bp.title
+    # commercial 은 자동 보강
+    assert bp.commercial_elements.recommendations
+    assert bp.commercial_elements.cta_candidates
+    assert bp.raw_signals.get("commercial_autofix")
+
+
+def test_phase2_fact_mapping_with_stub_crawler():
+    """Phase2 — fact_based 단락별 facts 모음 + 도메인 관련성."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.content_generator.phase2 import Phase2Collector, Phase2Config
+
+    GAME_BODY = (
+        "데드바이데이라이트는 4vs1 비대칭 호러 게임으로, 생존자가 발전기를 수리해 탈출합니다. "
+        "메그 토마스는 빠른 달리기로 초보에게 추천되는 생존자 캐릭터입니다. "
+        "킬러는 후크에 매달아 탈락시키며, 맵 별로 동선이 달라집니다. "
+        "초보자는 발전기 본딩을 피하고 안전한 코너를 활용해야 살아남습니다."
+    )
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, q, *, limit=5):
+            return [f"https://wiki.example/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(url=url, title="DBD 가이드", content=GAME_BODY)
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    bp = generate_blueprint(ctx, use_llm=False)
+    ph2 = Phase2Collector(StubCrawler(),
+                            config=Phase2Config(min_facts_per_section=1,
+                                                  min_total_facts=1,
+                                                  facts_per_query=2,
+                                                  pages_per_query=1))
+    res = ph2.run(bp, domain=ctx.domain)
+
+    assert res.total_facts >= 1
+    # fact_based 단락마다 sources 가 있어야 함
+    fact_sections = [p for p in bp.paragraphs if p.paragraph_type == "fact_based"]
+    assert len(res.sources_by_section) == len(fact_sections)
+    # 도메인 관련성 — 게임 본문이라 mismatch 안 나야 함
+    assert "domain_mismatch" not in " ".join(res.issues)
+    # FactItem 형태 확인
+    sample = next(iter(res.sources_by_section.values()))
+    assert sample[0].fact_text and sample[0].source_url
+
+
+def test_phase2_flags_domain_mismatch_on_off_topic_facts():
+    """게임 키워드인데 facts 가 일반 비즈니스 본문이면 domain_mismatch."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.content_generator.phase2 import Phase2Collector, Phase2Config
+
+    OFF_TOPIC = (
+        "디지털 전환을 진행하는 기업은 클라우드 인프라 구축으로 운영 효율을 높입니다. "
+        "SaaS 도입은 초기 투자 비용을 줄이고 유지보수 부담을 낮추는 효과가 있습니다. "
+        "고객 경험 관리는 마케팅 캠페인 측정 지표로 점점 더 중요해지고 있습니다. "
+        "데이터 거버넌스 정책 수립은 보안 사고를 줄이고 규제 대응에 도움이 됩니다."
+    )
+
+    class OffTopicCrawler(BaseCrawler):
+        name = "stub_off"
+        def search(self, q, *, limit=5):
+            return [f"https://biz.example/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(url=url, title="비즈니스 글", content=OFF_TOPIC)
+
+    ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+    bp = generate_blueprint(ctx, use_llm=False)
+    ph2 = Phase2Collector(OffTopicCrawler(),
+                            config=Phase2Config(min_facts_per_section=1,
+                                                  min_total_facts=1,
+                                                  facts_per_query=2,
+                                                  pages_per_query=1))
+    res = ph2.run(bp, domain=ctx.domain)
+    assert any("domain_mismatch" in i for i in res.issues), res.issues
+
+
+def test_phase2_flags_insufficient_facts():
+    """단락당 최소 facts 미달이면 issue."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.content_generator.phase2 import Phase2Collector, Phase2Config
+
+    class EmptyCrawler(BaseCrawler):
+        name = "empty"
+        def search(self, q, *, limit=5): return []
+        def scrape(self, url):
+            return CrawledPage(url=url, title="", content="")
+
+    ctx = KeywordContext.from_keyword("적금 추천")
+    bp = generate_blueprint(ctx, use_llm=False)
+    ph2 = Phase2Collector(EmptyCrawler(),
+                            config=Phase2Config(min_facts_per_section=3,
+                                                  min_total_facts=6))
+    res = ph2.run(bp, domain=ctx.domain)
+    assert res.total_facts == 0
+    assert any(i.startswith("insufficient_facts") for i in res.issues)
+    assert any(i.startswith("total_facts_too_low") for i in res.issues)
+
+
+def test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back():
+    """LLM 이 일반 템플릿(개념/활용/결론) 을 만들어도 phase1 이 reject 하고 룰 폴백."""
+    import os
+    from osmu_kr.content_generator import blueprint as bp_mod
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.embedder import StubEmbedder
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, q, *, limit=5): return []
+        def scrape(self, url): return CrawledPage(url=url, title="t", content="c")
+
+    bad = (
+        '{"title": "x",'
+        ' "target_reader": {"persona": "x", "knowledge_level": "초보", "primary_intent": "공략"},'
+        ' "paragraphs": ['
+        '   {"section_index": 1, "title": "개념", "paragraph_type": "llm_generated", "description": "x"},'
+        '   {"section_index": 2, "title": "활용", "paragraph_type": "fact_based", "description": "x"},'
+        '   {"section_index": 3, "title": "결론", "paragraph_type": "llm_generated", "description": "x"}'
+        ' ], "intro": "x", "short_conclusion": "x"}'
+    )
+    saved_post = bp_mod._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    saved_use = os.environ.get("OSMU_USE_LLM_BLUEPRINT")
+    os.environ["ANTHROPIC_API_KEY"] = "test"
+    os.environ["OSMU_USE_LLM_BLUEPRINT"] = "1"
+    bp_mod._post_anthropic = lambda *a, **kw: bad
+    try:
+        c = Collector(StubCrawler(), embedder=StubEmbedder())
+        ctx = KeywordContext.from_keyword("데드바이데이라이트 공략")
+        bp = c.phase1(ctx)
+    finally:
+        bp_mod._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+        if saved_use is None:
+            os.environ.pop("OSMU_USE_LLM_BLUEPRINT", None)
+        else:
+            os.environ["OSMU_USE_LLM_BLUEPRINT"] = saved_use
+
+    # reject → 룰 폴백 → 단락 제목이 ‘개념/활용/결론’ 이 아니라야 함
+    titles = " | ".join(p.title for p in bp.paragraphs)
+    assert "개념" not in titles or "활용" not in titles or "결론" not in titles
+    assert bp.raw_signals.get("reject_reasons")
+
+
+def test_interpreter_disable_env_var_blocks_llm():
+    """OSMU_DISABLE_LLM_INTERPRETER=1 이면 use_llm=True 라도 호출 안 한다."""
+    import os
+    from osmu_kr.content_generator import interpreter as itp
+
+    saved_post = itp._post_anthropic
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    saved_disable = os.environ.get("OSMU_DISABLE_LLM_INTERPRETER")
+    os.environ["ANTHROPIC_API_KEY"] = "test_key"
+    os.environ["OSMU_DISABLE_LLM_INTERPRETER"] = "1"
+
+    def boom(*_a, **_kw):
+        raise AssertionError("LLM 이 호출되면 안 된다")
+    itp._post_anthropic = boom
+    try:
+        ctx = itp.interpret("커피 그라인더 추천", use_llm=True)
+    finally:
+        itp._post_anthropic = saved_post
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+        if saved_disable is None:
+            os.environ.pop("OSMU_DISABLE_LLM_INTERPRETER", None)
+        else:
+            os.environ["OSMU_DISABLE_LLM_INTERPRETER"] = saved_disable
+
+    # disable 시엔 룰만 → source='rule' (use_llm 자체가 강제로 False 가 됨)
+    assert ctx.source == "rule"
+
+
 TESTS = [
     test_evaluator_deterministic,
     test_expander_includes_seed_and_dedups,
@@ -964,6 +1621,32 @@ TESTS = [
     test_keyword_context_coerce_accepts_str_and_passthrough,
     test_collector_logs_topic_hint_for_game_keyword,
     test_collector_accepts_keyword_context_directly,
+    # ── [2단계] interpreter: LLM 보강 + 폴백 ──
+    test_keyword_context_topic_summary_filled_by_rule,
+    test_interpreter_rule_only_when_use_llm_false,
+    test_interpreter_llm_fallback_when_no_api_key,
+    test_interpreter_llm_overrides_when_call_succeeds,
+    test_interpreter_llm_failure_falls_back_to_rule,
+    test_interpreter_passthrough_when_already_context,
+    test_interpreter_disable_env_var_blocks_llm,
+    # ── [3단계] collector Phase 1 — Blueprint + 검증 + 임베딩 ──
+    test_blueprint_rule_mode_basic_shape,
+    test_blueprint_llm_overrides_when_call_succeeds,
+    test_blueprint_llm_failure_falls_back_to_rule,
+    test_blueprint_validator_rejects_generic_template,
+    test_blueprint_validator_accepts_concrete_template,
+    test_stub_embedder_deterministic_and_dim,
+    test_zero_embedder_returns_none,
+    test_build_embedder_respects_env,
+    test_collector_phase1_full_with_stub_embedder,
+    # ── [4단계] Commercial + Phase 2 ──
+    test_blueprint_rule_mode_includes_commercial_elements,
+    test_blueprint_llm_response_with_commercial_elements,
+    test_phase1_autofills_commercial_when_llm_omits_them,
+    test_phase2_fact_mapping_with_stub_crawler,
+    test_phase2_flags_domain_mismatch_on_off_topic_facts,
+    test_phase2_flags_insufficient_facts,
+    test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back,
 ]
 
 
