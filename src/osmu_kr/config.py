@@ -54,6 +54,11 @@ class Config:
     # SQLite v1 — OSMU_STORAGE_BACKEND=sqlite 일 때 사용
     sqlite_db_path: str = field(default_factory=lambda: _s("OSMU_SQLITE_PATH", "./osmu.db"))
 
+    # PostgreSQL — OSMU_STORAGE_BACKEND=postgres 일 때 사용 (Neon 등)
+    database_url: Optional[str] = field(default_factory=lambda: os.getenv("OSMU_DATABASE_URL") or None)
+    db_pool_min: int = field(default_factory=lambda: _i("OSMU_DB_POOL_MIN", 1))
+    db_pool_max: int = field(default_factory=lambda: _i("OSMU_DB_POOL_MAX", 4))
+
     evaluator: str = field(default_factory=lambda: _s("OSMU_EVALUATOR", "heuristic"))
 
     pool_max_size: int = field(default_factory=lambda: _i("OSMU_POOL_MAX_SIZE", 200))

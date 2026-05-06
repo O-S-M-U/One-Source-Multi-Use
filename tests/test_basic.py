@@ -1709,6 +1709,125 @@ def test_generator_persists_phase1_phase2_payload_to_sqlite():
     storage.close()
 
 
+# ────────────────────────────────────────────────────────
+# [6단계] PostgreSQL + pgvector — Neon 등 (실DB 없으면 자동 skip)
+# ────────────────────────────────────────────────────────
+class _SkipNoDB(Exception):
+    """psycopg/pgvector 미설치 또는 OSMU_DATABASE_URL 미설정 시 자동 skip."""
+    pass
+
+
+def _need_postgres():
+    import os, importlib
+    url = os.environ.get("OSMU_DATABASE_URL", "")
+    if not url:
+        raise _SkipNoDB("OSMU_DATABASE_URL not set")
+    try:
+        importlib.import_module("psycopg")
+    except ImportError:
+        raise _SkipNoDB("psycopg not installed")
+    return url
+
+
+def test_postgres_storage_imports_without_db_url():
+    """모듈 import 자체는 DB 없이도 안전해야 한다 (lazy import)."""
+    from osmu_kr.storage import postgres  # noqa: F401
+    from osmu_kr.storage import postgres_schema  # noqa: F401
+    assert hasattr(postgres, "PostgresStorage")
+
+
+def test_postgres_factory_raises_without_url():
+    """OSMU_STORAGE_BACKEND=postgres 인데 DATABASE_URL 비면 분명한 에러."""
+    import os
+    from osmu_kr import Config
+    from osmu_kr.storage.factory import build_storage
+
+    saved_be = os.environ.get("OSMU_STORAGE_BACKEND")
+    saved_url = os.environ.get("OSMU_DATABASE_URL")
+    os.environ["OSMU_STORAGE_BACKEND"] = "postgres"
+    os.environ.pop("OSMU_DATABASE_URL", None)
+    try:
+        try:
+            build_storage(Config())
+            assert False, "RuntimeError 가 나야 함"
+        except RuntimeError as e:
+            assert "OSMU_DATABASE_URL" in str(e)
+    finally:
+        if saved_be is None:
+            os.environ.pop("OSMU_STORAGE_BACKEND", None)
+        else:
+            os.environ["OSMU_STORAGE_BACKEND"] = saved_be
+        if saved_url is not None:
+            os.environ["OSMU_DATABASE_URL"] = saved_url
+
+
+def test_postgres_storage_round_trip_when_db_available():
+    """실 DB(Neon 등) 가 있을 때만 라운드트립 검증 — 아니면 skip."""
+    try:
+        url = _need_postgres()
+    except _SkipNoDB as e:
+        print(f"  SKIP postgres 테스트: {e}")
+        return
+
+    import json
+    from osmu_kr.models import ContentRecord, KeywordPoolItem
+    from osmu_kr.storage.postgres import PostgresStorage
+
+    s = PostgresStorage(database_url=url)
+
+    # 격리 — 테스트 시작 시 정리
+    s.conn.cursor().execute("DELETE FROM contents")
+    s.conn.cursor().execute("DELETE FROM keywords")
+    s.conn.commit()
+
+    # pool
+    item = KeywordPoolItem(
+        keyword_id="pg-0001", seed_keyword="다이어트", keyword="직장인 다이어트 식단",
+        score=82.5, status="golden", grade="황금", profile="롱테일",
+    )
+    s.upsert_pool(item)
+    pool = s.list_pool()
+    assert any(p.keyword_id == "pg-0001" for p in pool)
+
+    # content + 임베딩
+    embedding = [0.01] * 768
+    rec = ContentRecord(
+        id="pg-c-001",
+        keyword="데드바이데이라이트 공략",
+        title="DBD 초보 공략",
+        status="generated",
+        refined_post="<h1>DBD</h1>",
+        target_reader_json='{"primary_intent": "공략"}',
+        paragraph_blueprint_json='[{"section_index":1,"title":"x","paragraph_type":"llm_generated","description":"x"}]',
+        normalized_sources_json='{"2": []}',
+        summary_embedding_json=json.dumps(embedding),
+        commercial_elements_json='{"recommendations":["메그"]}',
+    )
+    s.append_content(rec)
+    loaded = [r for r in s.list_content() if r.id == "pg-c-001"]
+    assert loaded
+    r = loaded[0]
+    if s.use_vector:
+        assert len(json.loads(r.summary_embedding_json)) == 768
+
+    # update
+    assert s.update_content("pg-c-001", status="발행완료") is True
+    assert any(rr.status == "발행완료" for rr in s.list_content() if rr.id == "pg-c-001")
+
+    # 자기잠식 ANN — pgvector 가용한 경우만
+    if s.use_vector:
+        sims = s.find_similar_contents(embedding, top_k=3)
+        assert sims
+        first_rec, score = sims[0]
+        assert first_rec.id == "pg-c-001"
+        assert 0.0 <= score <= 1.0
+
+    # cleanup
+    s.delete_content("pg-c-001")
+    s.delete_pool("pg-0001")
+    s.close()
+
+
 def test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back():
     """LLM 이 일반 템플릿(개념/활용/결론) 을 만들어도 phase1 이 reject 하고 룰 폴백."""
     import os
@@ -1869,6 +1988,10 @@ TESTS = [
     test_sqlite_storage_history_round_trip,
     test_factory_builds_sqlite_when_backend_is_sqlite,
     test_generator_persists_phase1_phase2_payload_to_sqlite,
+    # ── [6단계] PostgreSQL + pgvector ──
+    test_postgres_storage_imports_without_db_url,
+    test_postgres_factory_raises_without_url,
+    test_postgres_storage_round_trip_when_db_available,
 ]
 
 

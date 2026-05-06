@@ -14,3 +14,8 @@ python-dotenv>=1.0.0
 # 네이버 API / pytrends (선택 — naver_golden 평가기용)
 requests>=2.31.0
 pytrends>=4.9.0
+
+# PostgreSQL + pgvector (운영 — Neon 등) — 선택
+# 없으면 sqlite/local/sheets 백엔드만 활성
+psycopg[binary]>=3.1.0
+pgvector>=0.2.4

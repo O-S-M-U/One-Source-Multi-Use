@@ -46,6 +46,22 @@ def _build_sqlite(cfg: Config) -> BaseStorage:
     return SqliteStorage(db_path=db_path)
 
 
+def _build_postgres(cfg: Config) -> BaseStorage:
+    """PostgreSQL + pgvector 백엔드 (Neon 등) — DATABASE_URL 필수."""
+    from .postgres import PostgresStorage
+    url = getattr(cfg, "database_url", None) or ""
+    if not url:
+        raise RuntimeError(
+            "OSMU_DATABASE_URL 이 비어 있습니다. "
+            "Neon/Supabase 등에서 발급받은 PostgreSQL 연결 문자열을 .env 에 설정하세요."
+        )
+    return PostgresStorage(
+        database_url=url,
+        pool_min=getattr(cfg, "db_pool_min", 1),
+        pool_max=getattr(cfg, "db_pool_max", 4),
+    )
+
+
 def build_storage(cfg: Config) -> BaseStorage:
     backend = cfg.resolved_backend()
 
@@ -54,6 +70,9 @@ def build_storage(cfg: Config) -> BaseStorage:
 
     if backend == "sqlite":
         return _build_sqlite(cfg)
+
+    if backend == "postgres":
+        return _build_postgres(cfg)
 
     if backend == "sheets":
         sh = _try_build_sheets(cfg)
