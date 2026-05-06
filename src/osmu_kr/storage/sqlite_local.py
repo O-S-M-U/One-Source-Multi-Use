@@ -17,8 +17,8 @@ import sqlite3
 from typing import List, Optional
 
 from ..models import (
-    ContentRecord, KeywordPoolItem, ResearchHistoryRecord,
-    normalize_status, now_utc, to_iso,
+    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+    USAGE_IN_PROGRESS, normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
 from .sqlite_schema import open_connection, transaction
@@ -77,6 +77,8 @@ class SqliteStorage(BaseStorage):
             archived_at=row["archived_at"] or "",
             account_id=row["account_id"] or "",
             last_status_reason=row["last_status_reason"] or "",
+            embedding_json=row["embedding_json"] or "",
+            last_evaluated_at=row["last_evaluated_at"] or "",
         )
 
     # ── pool ────────────────────────────────────────────
@@ -109,10 +111,12 @@ class SqliteStorage(BaseStorage):
                     source, note,
                     inprogress_locked_at, published_at, failed_at, archived_at,
                     account_id, last_status_reason,
+                    embedding_json, last_evaluated_at,
                     created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?, ?,
                           ?, ?, ?, ?, ?, ?,
+                          ?, ?,
                           ?, ?)
                 ON CONFLICT(keyword_id) DO UPDATE SET
                     keyword=excluded.keyword,
@@ -137,6 +141,8 @@ class SqliteStorage(BaseStorage):
                     archived_at=excluded.archived_at,
                     account_id=excluded.account_id,
                     last_status_reason=excluded.last_status_reason,
+                    embedding_json=excluded.embedding_json,
+                    last_evaluated_at=excluded.last_evaluated_at,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -150,6 +156,7 @@ class SqliteStorage(BaseStorage):
                     item.inprogress_locked_at, item.published_at,
                     item.failed_at, item.archived_at,
                     item.account_id, item.last_status_reason,
+                    item.embedding_json, item.last_evaluated_at,
                     item.created_at, item.updated_at,
                 ),
             )
@@ -180,10 +187,12 @@ class SqliteStorage(BaseStorage):
                         source, note,
                         inprogress_locked_at, published_at, failed_at, archived_at,
                         account_id, last_status_reason,
+                        embedding_json, last_evaluated_at,
                         created_at, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                               ?, ?, ?, ?, ?, ?, ?,
                               ?, ?, ?, ?, ?, ?,
+                              ?, ?,
                               ?, ?)
                     """,
                     (
@@ -197,6 +206,7 @@ class SqliteStorage(BaseStorage):
                         it.inprogress_locked_at, it.published_at,
                         it.failed_at, it.archived_at,
                         it.account_id, it.last_status_reason,
+                        it.embedding_json, it.last_evaluated_at,
                         it.created_at, it.updated_at,
                     ),
                 )
@@ -379,15 +389,73 @@ class SqliteStorage(BaseStorage):
             ))
         return out
 
-    # ── 향후 확장용 헬퍼 (v1 에선 사용 안 함) ───────────
-    def record_usage(self, keyword: str, *, seed_keyword: str = "",
-                      content_id: str = "", note: str = "") -> None:
+    # ── v13 keyword_usages CRUD ────────────────────────
+    @staticmethod
+    def _row_to_usage(row: sqlite3.Row) -> KeywordUsage:
+        return KeywordUsage(
+            id=row["id"],
+            keyword_id=row["keyword_id"],
+            account_id=row["account_id"] or "",
+            blog_id=row["blog_id"] or "",
+            contents_id=row["contents_id"] or "",
+            status=row["status"] or USAGE_IN_PROGRESS,
+            started_at=row["started_at"],
+            published_at=row["published_at"] or "",
+            failed_at=row["failed_at"] or "",
+            note=row["note"] or "",
+        )
+
+    def list_usages(self) -> List[KeywordUsage]:
+        cur = self.conn.execute(
+            "SELECT * FROM keyword_usages ORDER BY started_at",
+        )
+        return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    def get_active_usage(self, keyword_id: str) -> Optional[KeywordUsage]:
+        if not keyword_id:
+            return None
+        cur = self.conn.execute(
+            "SELECT * FROM keyword_usages "
+            "WHERE keyword_id = ? AND status = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (keyword_id, USAGE_IN_PROGRESS),
+        )
+        row = cur.fetchone()
+        return self._row_to_usage(row) if row else None
+
+    def list_usages_by_keyword(self, keyword_id: str) -> List[KeywordUsage]:
+        cur = self.conn.execute(
+            "SELECT * FROM keyword_usages WHERE keyword_id = ? ORDER BY started_at",
+            (keyword_id,),
+        )
+        return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    def upsert_usage(self, usage: KeywordUsage) -> None:
+        if not usage.id:
+            # 자동 ID 생성 — count + 1
+            cur = self.conn.execute("SELECT COUNT(*) FROM keyword_usages")
+            n = cur.fetchone()[0] or 0
+            usage.id = f"u{n + 1:06d}"
+        if not usage.started_at:
+            usage.started_at = to_iso(now_utc())
         with transaction(self.conn):
             self.conn.execute(
                 """
                 INSERT INTO keyword_usages
-                  (keyword, seed_keyword, used_at, content_id, note)
-                VALUES (?, ?, ?, ?, ?)
+                  (id, keyword_id, account_id, blog_id, contents_id,
+                   status, started_at, published_at, failed_at, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  keyword_id=excluded.keyword_id,
+                  account_id=excluded.account_id,
+                  blog_id=excluded.blog_id,
+                  contents_id=excluded.contents_id,
+                  status=excluded.status,
+                  published_at=excluded.published_at,
+                  failed_at=excluded.failed_at,
+                  note=excluded.note
                 """,
-                (keyword, seed_keyword, to_iso(now_utc()), content_id, note),
+                (usage.id, usage.keyword_id, usage.account_id, usage.blog_id,
+                 usage.contents_id, usage.status, usage.started_at,
+                 usage.published_at, usage.failed_at, usage.note),
             )

@@ -288,16 +288,16 @@ class KeywordResearcher:
     def recommend(self, top_n=5):
         return recommender.recommend(self.storage, self.cfg, top_n=top_n)
 
-    def select_for_content(self, keyword_id, *, original_source="", title_final=""):
-        """선택 → ContentRecord 생성 + 키워드를 inprogress 로 lock.
+    def select_for_content(self, keyword_id, *, original_source="", title_final="",
+                            account_id="", blog_id=""):
+        """v13: 선택 → ContentRecord 생성 + keyword_usages(in_progress) lock.
 
-        7단계-A 변경:
-          · 기존: pool 에서 keyword 를 삭제. → 작업 중단 시 키워드가 영구 잠김.
-          · 신규: SafetyLayer.transition(candidate → inprogress) 으로 lock.
-                  pool 에는 그대로 남되 status=inprogress 로 표시 — recommend()
-                  에서 자동 제외, 작업 완료/실패 시 published/failed 로 전이.
+        - keyword.status 자체는 active 로 둠. lock 은 keyword_usages 가 가짐.
+        - 같은 keyword 에 in_progress 가 이미 있으면 LockBusy.
+        - keyword 가 archived 면 거부.
+        - 작업 중단 시 SafetyLayer.mark_failed(usage_id) 로 잠금 해제.
         """
-        from .safety import SafetyLayer, TransitionError
+        from .safety import LockBusy, SafetyLayer, TransitionError
 
         item = self.storage.get_pool(keyword_id)
         if not item:
@@ -311,13 +311,6 @@ class KeywordResearcher:
                 f"{self.cfg.seed_cooldown_days}일 내에 사용됨"
             )
 
-        # candidate → inprogress lock
-        safety = SafetyLayer(self.storage)
-        try:
-            safety.to_inprogress(keyword_id, reason=f"select_for_content title={title_final[:50]}")
-        except TransitionError as e:
-            raise PermissionError(f"키워드를 inprogress 로 전환할 수 없습니다: {e}")
-
         record = ContentRecord(
             id=self._next_content_id(),
             keyword=item.keyword,
@@ -330,4 +323,22 @@ class KeywordResearcher:
             note=f"selected from pool (score={item.score})",
         )
         self.storage.append_content(record)
+
+        # keyword_usages 에 in_progress lock 생성
+        safety = SafetyLayer(self.storage)
+        try:
+            usage = safety.start_lock(
+                keyword_id,
+                account_id=account_id, blog_id=blog_id,
+                contents_id=record.id,
+                note=f"select title={title_final[:50]}",
+            )
+            # ContentRecord 에 usage 연결 (note 에 기록)
+            self.storage.update_content(
+                record.id, note=record.note + f" | usage={usage.id}"
+            )
+        except (LockBusy, TransitionError) as e:
+            # 컨텐츠 레코드는 살려두되 (작업 흔적), 사용자에게 명확한 에러
+            raise PermissionError(f"키워드 lock 실패: {e}")
+
         return record

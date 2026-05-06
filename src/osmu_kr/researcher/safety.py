@@ -1,23 +1,20 @@
-"""SafetyLayer — 키워드 안전장치 계층 (7단계).
+"""SafetyLayer (v13) — 키워드 작업 lifecycle / lock / archive 단일 진입점.
+
+[ v13 spec 정렬 ]
+  - keywords.status:        active | archived (단순 존재/제외)
+  - keyword_usages.status:  in_progress | published | failed (작업 lifecycle)
+  - keyword_usages 가 lock 의 ‘진실의 출처’.
+  - keywords.archive 는 영구 제외 신호.
 
 [ 책임 ]
-  · status 전이의 단일 진입점 — 직접 setattr 금지, transition() 통해서만.
-  · 전이 시 lifecycle 타임스탬프 자동 기록 (inprogress_locked_at / published_at /
-    failed_at / archived_at).
-  · 잘못된 전이 (예: archived → candidate) 는 거부.
-  · 향후 7-B(임베딩 자기잠식) / 7-C(timeout) / 7-D(콘텐츠 자기잠식) 정책의 호스트.
-
-[ 정책 — 7-A 단계 ]
-  candidate  → inprogress / archived
-  inprogress → published / failed / archived
-  failed     → candidate / archived       (재시도 또는 영구 제외)
-  published  → candidate / archived       (180일 후 재진입 또는 archive)
-  archived   → (없음 — 영구 제외)
-
-[ 사용 ]
-  safety = SafetyLayer(storage)
-  safety.transition(keyword_id, KSTATUS_INPROGRESS, reason="select_for_content")
-  safety.transition(keyword_id, KSTATUS_PUBLISHED, reason="auto-publish ok")
+  · start_lock(keyword_id, ...)  → keyword_usages(in_progress) 신규 레코드 생성.
+                                    이미 in_progress 가 있으면 LockBusy.
+  · mark_published(usage_id)     → in_progress → published. 발행 시각 기록.
+  · mark_failed(usage_id, ...)   → in_progress → failed. 잠금 즉시 해제.
+                                    published_at 은 빈 채로 유지 (180일 카운트 미적용).
+  · archive_keyword(keyword_id)  → keywords.status = archived (영구 제외).
+                                    in_progress lock 이 살아 있으면 자동 failed 처리.
+  · is_locked(keyword_id)        → 활성 lock 있는지 단순 조회.
 """
 from __future__ import annotations
 
@@ -25,9 +22,9 @@ import logging
 from typing import Optional
 
 from ..models import (
-    ALLOWED_TRANSITIONS, KSTATUS_ARCHIVED, KSTATUS_CANDIDATE, KSTATUS_FAILED,
-    KSTATUS_INPROGRESS, KSTATUS_PUBLISHED, KeywordPoolItem,
-    NEW_STATUS_SET, normalize_status, now_utc, to_iso,
+    KSTATUS_ACTIVE, KSTATUS_ARCHIVED, KeywordPoolItem, KeywordUsage,
+    USAGE_ALLOWED_TRANSITIONS, USAGE_FAILED, USAGE_IN_PROGRESS, USAGE_PUBLISHED,
+    normalize_status, now_utc, to_iso,
 )
 from ..storage.base import BaseStorage
 
@@ -38,94 +35,149 @@ class TransitionError(Exception):
     """status 전이가 정책상 허용되지 않을 때."""
 
 
+class LockBusy(Exception):
+    """이미 in_progress 잠금이 있어 새 작업을 시작할 수 없음."""
+
+
+class CooldownViolation(Exception):
+    """v13-B 어뷰징 쿨다운 위반 — 직전 발행과 유사도가 너무 높음."""
+
+
 class SafetyLayer:
-    """키워드 안전장치 — status 전이의 단일 진입점."""
+    """v13 키워드 작업 lifecycle 의 단일 진입점."""
 
     def __init__(self, storage: BaseStorage):
         self.storage = storage
 
-    # ── 핵심 ────────────────────────────────────────────
-    def transition(self, keyword_id: str, to_status: str,
-                    *, reason: str = "") -> KeywordPoolItem:
-        """status 전이 + lifecycle 타임스탬프 기록.
+    # ── lock 상태 조회 ─────────────────────────────────
+    def is_locked(self, keyword_id: str) -> bool:
+        return self.storage.get_active_usage(keyword_id) is not None
 
-        - 전이 자체가 ALLOWED_TRANSITIONS 에 없으면 TransitionError.
-        - 같은 status 로의 전이는 no-op (의도적으로 허용 — 멱등).
+    def active_usage(self, keyword_id: str) -> Optional[KeywordUsage]:
+        return self.storage.get_active_usage(keyword_id)
+
+    # ── lifecycle 전이 ─────────────────────────────────
+    def start_lock(self, keyword_id: str, *,
+                    account_id: str = "", blog_id: str = "",
+                    contents_id: str = "", note: str = "",
+                    cooldown_threshold: float = 0.85,
+                    cooldown_days: float = 3.0,
+                    skip_cooldown: bool = False) -> KeywordUsage:
+        """candidate → in_progress lock 생성 (작업 시작).
+
+        - keywords 가 archived 면 거부.
+        - 같은 keyword_id 의 in_progress 가 이미 있으면 LockBusy.
+        - v13-B: 어뷰징 쿨다운 위반 시 CooldownViolation (skip_cooldown=True 면 우회).
         """
-        target = normalize_status(to_status)
-        if target not in NEW_STATUS_SET:
-            raise TransitionError(f"unknown status: {to_status!r}")
-
         item = self.storage.get_pool(keyword_id)
         if item is None:
             raise TransitionError(f"keyword_id={keyword_id!r} 존재하지 않음")
+        if normalize_status(item.status) == KSTATUS_ARCHIVED:
+            raise TransitionError(f"archived 키워드는 작업 시작 불가 ({keyword_id})")
+        if self.is_locked(keyword_id):
+            raise LockBusy(f"keyword_id={keyword_id} 이미 in_progress lock 있음")
 
-        current = normalize_status(item.status)
-        if current == target:
-            log.info("[safety] %s: 이미 %s — no-op", keyword_id, target)
+        # v13-B: 어뷰징 쿨다운 — embedding 비교 (같은 blog 직전 발행과)
+        if not skip_cooldown and item.embedding_json:
+            from .keyword_safety import KeywordSafety
+            ks = KeywordSafety(self.storage)
+            conflict = ks.check_abuse_cooldown(
+                keyword_id, threshold=cooldown_threshold,
+                days=cooldown_days, blog_id=blog_id,
+            )
+            if conflict is not None:
+                raise CooldownViolation(
+                    f"abuse cooldown: '{conflict.match.keyword}' (sim={conflict.match.similarity:.3f}, "
+                    f"published={conflict.match.last_published}, "
+                    f"{conflict.days_remaining:.1f}일 남음)"
+                )
+
+        usage = KeywordUsage(
+            keyword_id=keyword_id,
+            account_id=account_id, blog_id=blog_id,
+            contents_id=contents_id,
+            status=USAGE_IN_PROGRESS,
+            started_at=to_iso(now_utc()),
+            note=note[:200],
+        )
+        self.storage.upsert_usage(usage)
+        log.info("[safety] lock 시작: keyword=%s usage=%s", keyword_id, usage.id)
+        return usage
+
+    def mark_published(self, usage_id: str, *,
+                        contents_id: str = "", note: str = "") -> KeywordUsage:
+        """in_progress → published. 발행 시각 기록."""
+        return self._transition_usage(
+            usage_id, USAGE_PUBLISHED,
+            extra={"published_at": to_iso(now_utc())},
+            contents_id=contents_id, note=note,
+        )
+
+    def mark_failed(self, usage_id: str, *, note: str = "") -> KeywordUsage:
+        """in_progress → failed. 잠금 즉시 해제. published_at = '' 유지."""
+        return self._transition_usage(
+            usage_id, USAGE_FAILED,
+            extra={"failed_at": to_iso(now_utc())},
+            note=note,
+        )
+
+    def fail_lock_for_keyword(self, keyword_id: str, *, note: str = "") -> Optional[KeywordUsage]:
+        """편의 — 해당 keyword 의 활성 lock 을 failed 로 즉시 해제."""
+        usage = self.storage.get_active_usage(keyword_id)
+        if usage is None:
+            return None
+        return self.mark_failed(usage.id, note=note)
+
+    # ── archive ────────────────────────────────────────
+    def archive_keyword(self, keyword_id: str, *, reason: str = "") -> KeywordPoolItem:
+        """keywords.status = archived. 활성 lock 이 있으면 자동 failed."""
+        item = self.storage.get_pool(keyword_id)
+        if item is None:
+            raise TransitionError(f"keyword_id={keyword_id!r} 없음")
+
+        if normalize_status(item.status) == KSTATUS_ARCHIVED:
+            log.info("[safety] %s: 이미 archived — no-op", keyword_id)
             return item
 
-        allowed = ALLOWED_TRANSITIONS.get(current, set())
-        if target not in allowed:
-            raise TransitionError(
-                f"전이 거부: {current} → {target} (허용 전이: {sorted(allowed)})"
-            )
+        # 활성 lock 자동 해제
+        active = self.storage.get_active_usage(keyword_id)
+        if active is not None:
+            self.mark_failed(active.id, note=f"auto_failed_by_archive: {reason}")
 
-        # 타임스탬프 기록
+        # keywords.status = archived
         ts = to_iso(now_utc())
-        item.status = target
-        item.last_status_reason = (reason or "")[:200]
+        item.status = KSTATUS_ARCHIVED
+        item.archived_at = ts
+        item.last_status_reason = (reason or "archive")[:200]
         item.updated_at = ts
-        if target == KSTATUS_INPROGRESS:
-            item.inprogress_locked_at = ts
-        elif target == KSTATUS_PUBLISHED:
-            item.published_at = ts
-            item.inprogress_locked_at = ""    # lock 해제
-        elif target == KSTATUS_FAILED:
-            item.failed_at = ts
-            item.inprogress_locked_at = ""
-        elif target == KSTATUS_ARCHIVED:
-            item.archived_at = ts
-            item.inprogress_locked_at = ""
-        elif target == KSTATUS_CANDIDATE:
-            # 재진입 — 모든 lock/실패 흔적 클리어 (published_at 은 180일 정책에 사용되니 유지)
-            item.inprogress_locked_at = ""
-            item.failed_at = ""
-
         self.storage.upsert_pool(item)
-        log.info("[safety] %s: %s → %s (%s)",
-                  keyword_id, current, target, reason or "no_reason")
+        log.info("[safety] archive: keyword=%s reason=%s", keyword_id, reason)
         return item
 
-    # ── 편의 메서드 ─────────────────────────────────────
-    def to_inprogress(self, keyword_id: str, reason: str = "") -> KeywordPoolItem:
-        return self.transition(keyword_id, KSTATUS_INPROGRESS, reason=reason)
+    # ── 내부 ───────────────────────────────────────────
+    def _transition_usage(self, usage_id: str, target: str, *,
+                           extra: Optional[dict] = None,
+                           contents_id: str = "", note: str = "") -> KeywordUsage:
+        usages = self.storage.list_usages()
+        usage = next((u for u in usages if u.id == usage_id), None)
+        if usage is None:
+            raise TransitionError(f"usage_id={usage_id!r} 없음")
 
-    def to_published(self, keyword_id: str, reason: str = "") -> KeywordPoolItem:
-        return self.transition(keyword_id, KSTATUS_PUBLISHED, reason=reason)
-
-    def to_failed(self, keyword_id: str, reason: str = "") -> KeywordPoolItem:
-        return self.transition(keyword_id, KSTATUS_FAILED, reason=reason)
-
-    def to_archived(self, keyword_id: str, reason: str = "") -> KeywordPoolItem:
-        return self.transition(keyword_id, KSTATUS_ARCHIVED, reason=reason)
-
-    def to_candidate(self, keyword_id: str, reason: str = "") -> KeywordPoolItem:
-        return self.transition(keyword_id, KSTATUS_CANDIDATE, reason=reason)
-
-    # ── 조회 ────────────────────────────────────────────
-    def candidates(self) -> list:
-        return [it for it in self.storage.list_pool()
-                if normalize_status(it.status) == KSTATUS_CANDIDATE]
-
-    def inprogress(self) -> list:
-        return [it for it in self.storage.list_pool()
-                if normalize_status(it.status) == KSTATUS_INPROGRESS]
-
-    def published(self) -> list:
-        return [it for it in self.storage.list_pool()
-                if normalize_status(it.status) == KSTATUS_PUBLISHED]
-
-    def archived(self) -> list:
-        return [it for it in self.storage.list_pool()
-                if normalize_status(it.status) == KSTATUS_ARCHIVED]
+        current = usage.status
+        if current == target:
+            return usage   # 멱등
+        allowed = USAGE_ALLOWED_TRANSITIONS.get(current, set())
+        if target not in allowed:
+            raise TransitionError(
+                f"usage 전이 거부: {current} → {target} (허용: {sorted(allowed)})"
+            )
+        usage.status = target
+        if contents_id:
+            usage.contents_id = contents_id
+        if note:
+            usage.note = (usage.note + " | " + note).strip(" |")[:300]
+        for k, v in (extra or {}).items():
+            setattr(usage, k, v)
+        self.storage.upsert_usage(usage)
+        log.info("[safety] usage %s: %s → %s", usage_id, current, target)
+        return usage

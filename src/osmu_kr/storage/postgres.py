@@ -18,8 +18,8 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from ..models import (
-    ContentRecord, KeywordPoolItem, ResearchHistoryRecord,
-    normalize_status, now_utc, to_iso,
+    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+    USAGE_IN_PROGRESS, normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
 from .postgres_schema import (
@@ -127,14 +127,14 @@ class PostgresStorage(BaseStorage):
             return ""
 
     # ── pool ────────────────────────────────────────────
-    @staticmethod
-    def _row_to_pool(row: tuple) -> KeywordPoolItem:
+    def _row_to_pool(self, row: tuple) -> KeywordPoolItem:
         (keyword_id, keyword, seed_keyword, status, grade, profile,
          weak_points, is_alchemy, original_keyword, revival_count,
          score, search_volume, competition, cpc, commercial_intent,
          source, note,
          inprogress_locked_at, published_at, failed_at, archived_at,
          account_id, last_status_reason,
+         last_evaluated_at, embedding_value,
          created_at, updated_at) = row
         return KeywordPoolItem(
             keyword_id=keyword_id, seed_keyword=seed_keyword, keyword=keyword,
@@ -160,28 +160,37 @@ class PostgresStorage(BaseStorage):
             archived_at=archived_at or "",
             account_id=account_id or "",
             last_status_reason=last_status_reason or "",
+            last_evaluated_at=last_evaluated_at or "",
+            embedding_json=self._embedding_from_db(embedding_value),
         )
 
-    _POOL_COLS = """
-        keyword_id, keyword, seed_keyword, status, grade, profile,
-        weak_points, is_alchemy, original_keyword, revival_count,
-        score, search_volume, competition, cpc, commercial_intent,
-        source, note,
-        inprogress_locked_at, published_at, failed_at, archived_at,
-        account_id, last_status_reason,
-        created_at, updated_at
-    """
+    @property
+    def _pool_cols(self) -> str:
+        # pgvector 활성 시 keywords.embedding (vector), 아니면 embedding_json (text)
+        embed_col = "embedding" if self.use_vector else "embedding_json"
+        return (
+            "keyword_id, keyword, seed_keyword, status, grade, profile, "
+            "weak_points, is_alchemy, original_keyword, revival_count, "
+            "score, search_volume, competition, cpc, commercial_intent, "
+            "source, note, "
+            "inprogress_locked_at, published_at, failed_at, archived_at, "
+            "account_id, last_status_reason, "
+            f"last_evaluated_at, {embed_col}, "
+            "created_at, updated_at"
+        )
+
+    _POOL_COLS = ""    # 호환 — 더 이상 사용되지 않음
 
     def list_pool(self) -> List[KeywordPoolItem]:
         with self.conn.cursor() as cur:
-            cur.execute(f"SELECT {self._POOL_COLS} FROM keywords ORDER BY created_at")
+            cur.execute(f"SELECT {self._pool_cols} FROM keywords ORDER BY created_at")
             return [self._row_to_pool(r) for r in cur.fetchall()]
 
     def get_pool(self, keyword_id: str) -> Optional[KeywordPoolItem]:
         if not keyword_id:
             return None
         with self.conn.cursor() as cur:
-            cur.execute(f"SELECT {self._POOL_COLS} FROM keywords WHERE keyword_id = %s",
+            cur.execute(f"SELECT {self._pool_cols} FROM keywords WHERE keyword_id = %s",
                         (keyword_id,))
             row = cur.fetchone()
             return self._row_to_pool(row) if row else None
@@ -190,13 +199,16 @@ class PostgresStorage(BaseStorage):
         item.updated_at = to_iso(now_utc())
         if not item.created_at:
             item.created_at = item.updated_at
+        embed_val = self._embedding_for_db(item.embedding_json)
+        embed_col = "embedding" if self.use_vector else "embedding_json"
         with self.conn.cursor() as cur:
             cur.execute(
                 f"""
-                INSERT INTO keywords ({self._POOL_COLS})
+                INSERT INTO keywords ({self._pool_cols})
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s,
+                        %s, %s,
                         %s, %s)
                 ON CONFLICT (keyword_id) DO UPDATE SET
                     keyword=EXCLUDED.keyword,
@@ -221,6 +233,8 @@ class PostgresStorage(BaseStorage):
                     archived_at=EXCLUDED.archived_at,
                     account_id=EXCLUDED.account_id,
                     last_status_reason=EXCLUDED.last_status_reason,
+                    last_evaluated_at=EXCLUDED.last_evaluated_at,
+                    {embed_col}=EXCLUDED.{embed_col},
                     updated_at=EXCLUDED.updated_at
                 """,
                 (item.keyword_id, item.keyword, item.seed_keyword,
@@ -233,6 +247,7 @@ class PostgresStorage(BaseStorage):
                  item.inprogress_locked_at, item.published_at,
                  item.failed_at, item.archived_at,
                  item.account_id, item.last_status_reason,
+                 item.last_evaluated_at, embed_val,
                  item.created_at, item.updated_at),
             )
         self.conn.commit()
@@ -253,11 +268,13 @@ class PostgresStorage(BaseStorage):
                     it.created_at = to_iso(now_utc())
                 if not it.updated_at:
                     it.updated_at = it.created_at
+                embed_val = self._embedding_for_db(it.embedding_json)
                 cur.execute(
-                    f"INSERT INTO keywords ({self._POOL_COLS}) VALUES "
+                    f"INSERT INTO keywords ({self._pool_cols}) VALUES "
                     "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
                     " %s, %s, %s, %s, %s, %s, %s, "
                     " %s, %s, %s, %s, %s, %s, "
+                    " %s, %s, "
                     " %s, %s)",
                     (it.keyword_id, it.keyword, it.seed_keyword,
                      it.status, it.grade, it.profile,
@@ -269,6 +286,7 @@ class PostgresStorage(BaseStorage):
                      it.inprogress_locked_at, it.published_at,
                      it.failed_at, it.archived_at,
                      it.account_id, it.last_status_reason,
+                     it.last_evaluated_at, embed_val,
                      it.created_at, it.updated_at),
                 )
         self.conn.commit()
@@ -464,6 +482,47 @@ class PostgresStorage(BaseStorage):
                 ))
             return out
 
+    # ── v13-B keyword embedding ANN (씨드 중복 + 어뷰징) ─
+    def find_similar_keywords(self, embedding: List[float],
+                                *, top_k: int = 10,
+                                exclude_id: str = "",
+                                only_status: str = "active",
+                                ) -> List[Tuple[KeywordPoolItem, float]]:
+        """keywords.embedding 코사인 ANN — 씨드 중복 / 어뷰징 쿨다운 비교.
+
+        Returns: [(KeywordPoolItem, similarity 0..1), ...] 유사도 내림차순.
+        """
+        if not self.use_vector:
+            raise NotImplementedError(
+                "pgvector 가 비활성 — keyword embedding ANN 검색은 pgvector 환경에서만 가능."
+            )
+        if not embedding or len(embedding) != EMBEDDING_DIM:
+            return []
+        sql = (
+            f"SELECT {self._pool_cols}, "
+            "       1 - (embedding <=> %s::vector) / 2 AS similarity "
+            "FROM keywords "
+            "WHERE embedding IS NOT NULL "
+            + ("AND status = %s " if only_status else "")
+            + ("AND keyword_id <> %s " if exclude_id else "")
+            + "ORDER BY embedding <=> %s::vector ASC "
+            + "LIMIT %s"
+        )
+        params: List[Any] = [embedding]
+        if only_status:
+            params.append(only_status)
+        if exclude_id:
+            params.append(exclude_id)
+        params += [embedding, top_k]
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            out: List[Tuple[KeywordPoolItem, float]] = []
+            for row in cur.fetchall():
+                item = self._row_to_pool(row[:-1])
+                sim = float(row[-1]) if row[-1] is not None else 0.0
+                out.append((item, sim))
+            return out
+
     # ── 자기잠식 1차 스크리닝 (pgvector ANN) ─────────────
     def find_similar_contents(self, embedding: List[float],
                                 *, top_k: int = 5,
@@ -501,16 +560,78 @@ class PostgresStorage(BaseStorage):
                 out.append((rec, sim))
             return out
 
-    # ── 향후: keyword_usages 헬퍼 ───────────────────────
-    def record_usage(self, keyword: str, *, seed_keyword: str = "",
-                      content_id: str = "", note: str = "") -> None:
+    # ── v13 keyword_usages CRUD ────────────────────────
+    _USAGE_COLS = (
+        "id, keyword_id, account_id, blog_id, contents_id, "
+        "status, started_at, published_at, failed_at, note"
+    )
+
+    @staticmethod
+    def _row_to_usage(row: tuple) -> KeywordUsage:
+        (id_, keyword_id, account_id, blog_id, contents_id,
+         status, started_at, published_at, failed_at, note) = row
+        return KeywordUsage(
+            id=id_, keyword_id=keyword_id, account_id=account_id or "",
+            blog_id=blog_id or "", contents_id=contents_id or "",
+            status=status or USAGE_IN_PROGRESS, started_at=started_at,
+            published_at=published_at or "", failed_at=failed_at or "",
+            note=note or "",
+        )
+
+    def list_usages(self) -> List[KeywordUsage]:
         with self.conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO keyword_usages
-                  (keyword, seed_keyword, used_at, content_id, note)
-                VALUES (%s, %s, %s, %s, %s)
+                f"SELECT {self._USAGE_COLS} FROM keyword_usages ORDER BY started_at"
+            )
+            return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    def get_active_usage(self, keyword_id: str) -> Optional[KeywordUsage]:
+        if not keyword_id:
+            return None
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._USAGE_COLS} FROM keyword_usages "
+                "WHERE keyword_id = %s AND status = %s "
+                "ORDER BY started_at DESC LIMIT 1",
+                (keyword_id, USAGE_IN_PROGRESS),
+            )
+            row = cur.fetchone()
+            return self._row_to_usage(row) if row else None
+
+    def list_usages_by_keyword(self, keyword_id: str) -> List[KeywordUsage]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {self._USAGE_COLS} FROM keyword_usages "
+                "WHERE keyword_id = %s ORDER BY started_at",
+                (keyword_id,),
+            )
+            return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    def upsert_usage(self, usage: KeywordUsage) -> None:
+        if not usage.id:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM keyword_usages")
+                n = cur.fetchone()[0] or 0
+            usage.id = f"u{n + 1:06d}"
+        if not usage.started_at:
+            usage.started_at = to_iso(now_utc())
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO keyword_usages ({self._USAGE_COLS})
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                  keyword_id=EXCLUDED.keyword_id,
+                  account_id=EXCLUDED.account_id,
+                  blog_id=EXCLUDED.blog_id,
+                  contents_id=EXCLUDED.contents_id,
+                  status=EXCLUDED.status,
+                  published_at=EXCLUDED.published_at,
+                  failed_at=EXCLUDED.failed_at,
+                  note=EXCLUDED.note
                 """,
-                (keyword, seed_keyword, to_iso(now_utc()), content_id, note),
+                (usage.id, usage.keyword_id, usage.account_id, usage.blog_id,
+                 usage.contents_id, usage.status, usage.started_at,
+                 usage.published_at, usage.failed_at, usage.note),
             )
         self.conn.commit()

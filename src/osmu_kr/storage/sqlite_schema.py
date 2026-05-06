@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS keywords (
     archived_at           TEXT    NOT NULL DEFAULT '',
     account_id            TEXT    NOT NULL DEFAULT '',
     last_status_reason    TEXT    NOT NULL DEFAULT '',
+    embedding_json        TEXT    NOT NULL DEFAULT '',
+    last_evaluated_at     TEXT    NOT NULL DEFAULT '',
     created_at            TEXT    NOT NULL,
     updated_at            TEXT    NOT NULL
 );
@@ -94,11 +96,15 @@ CREATE TABLE IF NOT EXISTS keyword_evaluations (
 
 DDL_KEYWORD_USAGES = """
 CREATE TABLE IF NOT EXISTS keyword_usages (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    keyword       TEXT    NOT NULL,
-    seed_keyword  TEXT    NOT NULL DEFAULT '',
-    used_at       TEXT    NOT NULL,
-    content_id    TEXT    NOT NULL DEFAULT '',
+    id            TEXT    PRIMARY KEY,
+    keyword_id    TEXT    NOT NULL,
+    account_id    TEXT    NOT NULL DEFAULT '',
+    blog_id       TEXT    NOT NULL DEFAULT '',
+    contents_id   TEXT    NOT NULL DEFAULT '',
+    status        TEXT    NOT NULL DEFAULT 'in_progress',
+    started_at    TEXT    NOT NULL,
+    published_at  TEXT    NOT NULL DEFAULT '',
+    failed_at     TEXT    NOT NULL DEFAULT '',
     note          TEXT    NOT NULL DEFAULT ''
 );
 """
@@ -150,8 +156,10 @@ DDL_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_keywords_published ON keywords(published_at)",
     "CREATE INDEX IF NOT EXISTS idx_evaluations_keyword ON keyword_evaluations(keyword)",
     "CREATE INDEX IF NOT EXISTS idx_evaluations_created ON keyword_evaluations(created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_usages_keyword ON keyword_usages(keyword)",
-    "CREATE INDEX IF NOT EXISTS idx_usages_used_at ON keyword_usages(used_at)",
+    "CREATE INDEX IF NOT EXISTS idx_usages_keyword_id ON keyword_usages(keyword_id)",
+    "CREATE INDEX IF NOT EXISTS idx_usages_status ON keyword_usages(status)",
+    "CREATE INDEX IF NOT EXISTS idx_usages_blog ON keyword_usages(blog_id)",
+    "CREATE INDEX IF NOT EXISTS idx_usages_published ON keyword_usages(published_at)",
     "CREATE INDEX IF NOT EXISTS idx_contents_keyword ON contents(keyword)",
     "CREATE INDEX IF NOT EXISTS idx_contents_status  ON contents(status)",
     "CREATE INDEX IF NOT EXISTS idx_contents_created ON contents(created_at)",

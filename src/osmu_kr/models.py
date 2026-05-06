@@ -159,14 +159,18 @@ class KeywordPoolItem:
     revival_count: int = 0          # 부활 심사 통과 횟수
 
     # ── 7단계-A 신규 — 안전장치 lifecycle ──
-    # status 는 KSTATUS_* (candidate/inprogress/published/failed/archived) 권장.
-    # legacy(golden/medium/...) 가 들어와도 normalize_status() 가 자동 변환.
-    inprogress_locked_at: str = ""   # candidate→inprogress 전이 시각 (timeout 기준)
-    published_at: str = ""           # inprogress→published 전이 시각 (180일 재진입 기준)
-    failed_at: str = ""              # → failed 전이 시각
-    archived_at: str = ""            # → archived 전이 시각
+    # v13: 작업 lifecycle 은 keyword_usages 가 책임. 아래 컬럼은 호환·감사용.
+    inprogress_locked_at: str = ""   # (legacy) — v13 에선 keyword_usages 가 사용
+    published_at: str = ""           # (legacy) — v13 에선 keyword_usages.published_at
+    failed_at: str = ""              # (legacy)
+    archived_at: str = ""            # → archived 전이 시각 (v13 active/archived 에서 유효)
     account_id: str = ""             # 멀티 계정 v2 — v1 에선 빈 문자열 = '본인'
     last_status_reason: str = ""     # 최근 status 전이 사유 (디버깅·감사용)
+    # ── v13-B 신규 — 키워드 임베딩 (씨드 중복 + 어뷰징 쿨다운 비교용) ──
+    # 768-dim List[float] 의 JSON 직렬화 텍스트.
+    # PostgreSQL 백엔드는 vector(768) 컬럼에 저장, SQLite/CSV 는 그대로 JSON.
+    embedding_json: str = ""
+    last_evaluated_at: str = ""      # housekeeping(re-evaluation) 트리거 기준
 
     HEADER = [
         "keyword_id", "seed_keyword", "keyword",
@@ -179,6 +183,8 @@ class KeywordPoolItem:
         # 7단계-A 신규
         "inprogress_locked_at", "published_at", "failed_at", "archived_at",
         "account_id", "last_status_reason",
+        # v13-B 신규
+        "embedding_json", "last_evaluated_at",
     ]
 
     def to_row(self) -> list:
@@ -215,12 +221,61 @@ class KeywordPoolItem:
             archived_at=str(d.get("archived_at") or ""),
             account_id=str(d.get("account_id") or ""),
             last_status_reason=str(d.get("last_status_reason") or ""),
+            embedding_json=str(d.get("embedding_json") or ""),
+            last_evaluated_at=str(d.get("last_evaluated_at") or ""),
         )
 
     def fill_grade(self) -> None:
         """score → grade 자동 채우기."""
         if not self.grade:
             self.grade = grade_from_score(self.score)
+
+
+@dataclass
+class KeywordUsage:
+    """v13 keyword_usages — 블로그별 키워드 사용 이력 (작업 lifecycle).
+
+    필드:
+      · id           : 자동 생성 (또는 storage 가 부여)
+      · keyword_id   : keywords 참조
+      · account_id   : 사용자 계정 (v1: 단일계정이면 빈 값 가능)
+      · blog_id      : 블로그 식별자 (자기잠식 체크 단위)
+      · contents_id  : contents 테이블 참조 (Phase 1 후 채움)
+      · status       : in_progress / published / failed
+      · started_at   : in_progress 시작 시각 (lock 기준)
+      · published_at : 발행 시각 (180일 재사용 카운트 기준; failed 면 빈 문자열)
+      · failed_at    : 실패 시각 (감사용)
+      · note         : 진행 메모 / 실패 사유 등
+    """
+    id: str = ""
+    keyword_id: str = ""
+    account_id: str = ""
+    blog_id: str = ""
+    contents_id: str = ""
+    status: str = USAGE_IN_PROGRESS
+    started_at: str = field(default_factory=lambda: to_iso(now_utc()))
+    published_at: str = ""
+    failed_at: str = ""
+    note: str = ""
+
+    HEADER = [
+        "id", "keyword_id", "account_id", "blog_id", "contents_id",
+        "status", "started_at", "published_at", "failed_at", "note",
+    ]
+
+    def to_row(self) -> list:
+        d = asdict(self)
+        return [d[k] for k in self.HEADER]
+
+    @classmethod
+    def from_row(cls, row: list) -> "KeywordUsage":
+        padded = list(row) + [""] * (len(cls.HEADER) - len(row))
+        d = dict(zip(cls.HEADER, padded))
+        return cls(**{k: str(v) if v is not None else "" for k, v in d.items()})
+
+    def is_active_lock(self) -> bool:
+        """in_progress 상태에서 잠금 활성 여부."""
+        return self.status == USAGE_IN_PROGRESS
 
 
 @dataclass

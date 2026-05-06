@@ -62,10 +62,23 @@ CREATE TABLE IF NOT EXISTS keywords (
     archived_at           TEXT             NOT NULL DEFAULT '',
     account_id            TEXT             NOT NULL DEFAULT '',
     last_status_reason    TEXT             NOT NULL DEFAULT '',
+    last_evaluated_at     TEXT             NOT NULL DEFAULT '',
     created_at            TEXT             NOT NULL,
     updated_at            TEXT             NOT NULL
 );
 """
+
+# pgvector 사용 시 keywords 테이블에 embedding 컬럼 별도 추가 (있을 때만)
+DDL_KEYWORDS_EMBEDDING_VECTOR = (
+    "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS embedding vector(768)"
+)
+DDL_KEYWORDS_EMBEDDING_TEXT = (
+    "ALTER TABLE keywords ADD COLUMN IF NOT EXISTS embedding_json TEXT NOT NULL DEFAULT ''"
+)
+DDL_KEYWORDS_EMBED_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_keywords_embedding_ivfflat "
+    "ON keywords USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+)
 
 DDL_KEYWORD_EVALUATIONS = """
 CREATE TABLE IF NOT EXISTS keyword_evaluations (
@@ -95,11 +108,15 @@ CREATE TABLE IF NOT EXISTS keyword_evaluations (
 
 DDL_KEYWORD_USAGES = """
 CREATE TABLE IF NOT EXISTS keyword_usages (
-    id            BIGSERIAL PRIMARY KEY,
-    keyword       TEXT      NOT NULL,
-    seed_keyword  TEXT      NOT NULL DEFAULT '',
-    used_at       TEXT      NOT NULL,
-    content_id    TEXT      NOT NULL DEFAULT '',
+    id            TEXT      PRIMARY KEY,
+    keyword_id    TEXT      NOT NULL,
+    account_id    TEXT      NOT NULL DEFAULT '',
+    blog_id       TEXT      NOT NULL DEFAULT '',
+    contents_id   TEXT      NOT NULL DEFAULT '',
+    status        TEXT      NOT NULL DEFAULT 'in_progress',
+    started_at    TEXT      NOT NULL,
+    published_at  TEXT      NOT NULL DEFAULT '',
+    failed_at     TEXT      NOT NULL DEFAULT '',
     note          TEXT      NOT NULL DEFAULT ''
 );
 """
@@ -203,11 +220,21 @@ def initialize_schema(conn: "psycopg.Connection") -> bool:
                     DDL_KEYWORD_USAGES, DDL_ACCOUNTS,
                     ddl_contents(use_vector)):
             cur.execute(ddl)
+        # keywords.embedding 컬럼 — pgvector 면 vector(768), 아니면 text
+        try:
+            if use_vector:
+                cur.execute(DDL_KEYWORDS_EMBEDDING_VECTOR)
+            else:
+                cur.execute(DDL_KEYWORDS_EMBEDDING_TEXT)
+        except Exception as e:
+            log.info("[postgres_schema] keywords.embedding ALTER 보류: %s", e)
+            conn.rollback()
         for idx in DDL_INDEXES_COMMON:
             cur.execute(idx)
         if use_vector:
             try:
                 cur.execute(DDL_INDEX_VECTOR)
+                cur.execute(DDL_KEYWORDS_EMBED_INDEX)
             except Exception as e:
                 # ivfflat 인덱스는 row 0 일 때 종종 실패 — 무시 가능
                 log.info("[postgres_schema] ivfflat 인덱스 생성 보류: %s", e)

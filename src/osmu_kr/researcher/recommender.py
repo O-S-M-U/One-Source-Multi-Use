@@ -6,7 +6,8 @@ from typing import List, Optional
 
 from ..config import Config
 from ..models import (
-    ContentRecord, KeywordPoolItem, KSTATUS_CANDIDATE,
+    ContentRecord, KeywordPoolItem, KSTATUS_ACTIVE, KSTATUS_ARCHIVED,
+    USAGE_IN_PROGRESS, USAGE_PUBLISHED,
     from_iso, normalize_status, now_utc,
 )
 from ..storage.base import BaseStorage
@@ -34,18 +35,39 @@ def _seeds_in_cooldown(records, cooldown_days):
     return seeds
 
 
-def recommend(storage: BaseStorage, cfg: Config, top_n: int = 5):
+def recommend(storage: BaseStorage, cfg: Config, top_n: int = 5,
+              *, blog_id: str = ""):
+    """v13 추천 로직.
+
+    제외 조건:
+      · keywords.status = archived
+      · 해당 keyword 에 활성 in_progress lock 이 있음 (이미 작업 중)
+      · 같은 blog_id 에서 이미 published 상태로 사용된 적 있음 (자기잠식 차단)
+      · 최근 cooldown 안의 seed
+      · 직전 발행 seed (연속 회피)
+    """
     pool = storage.list_pool()
     contents = storage.list_content()
-    blocked = _seeds_in_cooldown(contents, cfg.seed_cooldown_days)
+    blocked_seeds = _seeds_in_cooldown(contents, cfg.seed_cooldown_days)
     last = _last_seed(contents) if cfg.avoid_consecutive_topic else None
 
+    # keyword_id → 활성 lock / 같은 blog 에서 published 여부
+    locked_kids = set()
+    published_in_blog_kids = set()
+    for u in storage.list_usages():
+        if u.status == USAGE_IN_PROGRESS:
+            locked_kids.add(u.keyword_id)
+        if blog_id and u.status == USAGE_PUBLISHED and u.blog_id == blog_id:
+            published_in_blog_kids.add(u.keyword_id)
+
     def is_eligible(item):
-        # 7단계-A: candidate 만 추천 대상. inprogress/published/failed/archived 모두 제외.
-        # legacy 'golden' / 'medium' 도 normalize_status 가 candidate 로 매핑해줌.
-        if normalize_status(item.status) != KSTATUS_CANDIDATE:
+        if normalize_status(item.status) != KSTATUS_ACTIVE:
             return False
-        if item.seed_keyword in blocked:
+        if item.keyword_id in locked_kids:
+            return False
+        if item.keyword_id in published_in_blog_kids:
+            return False
+        if item.seed_keyword in blocked_seeds:
             return False
         if last and item.seed_keyword == last:
             return False

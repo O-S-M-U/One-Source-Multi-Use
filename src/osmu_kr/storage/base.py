@@ -4,7 +4,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from ..models import ContentRecord, KeywordPoolItem, ResearchHistoryRecord
+from ..models import (
+    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+)
 
 
 class BaseStorage(ABC):
@@ -83,6 +85,29 @@ class BaseStorage(ABC):
     def list_history(self) -> List[ResearchHistoryRecord]:
         """미구현 백엔드는 빈 리스트."""
         return []
+
+    # ── v13 keyword_usages — 작업 lifecycle (lock + 발행 이력) ──
+    # 미구현 백엔드(csv/xlsx/sheets) 는 내부 메모리 dict 로 동작 (휘발성).
+    def list_usages(self) -> List[KeywordUsage]:
+        return list(getattr(self, "_in_memory_usages", {}).values())
+
+    def get_active_usage(self, keyword_id: str) -> Optional[KeywordUsage]:
+        """해당 keyword_id 의 in_progress 사용 레코드 (= lock). 없으면 None."""
+        for u in self.list_usages():
+            if u.keyword_id == keyword_id and u.is_active_lock():
+                return u
+        return None
+
+    def upsert_usage(self, usage: KeywordUsage) -> None:
+        """in-memory 폴백 — DB 백엔드는 override."""
+        if not hasattr(self, "_in_memory_usages"):
+            self._in_memory_usages = {}
+        if not usage.id:
+            usage.id = f"u{len(self._in_memory_usages) + 1:04d}"
+        self._in_memory_usages[usage.id] = usage
+
+    def list_usages_by_keyword(self, keyword_id: str) -> List[KeywordUsage]:
+        return [u for u in self.list_usages() if u.keyword_id == keyword_id]
 
     def find_pool_by_keyword(self, keyword: str) -> Optional[KeywordPoolItem]:
         kw = (keyword or "").strip().lower()

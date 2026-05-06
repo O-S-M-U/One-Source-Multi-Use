@@ -57,20 +57,33 @@ def test_run_seed_creates_pool_items():
     assert rep.expanded > 0
 
 
-def test_select_records_content_and_locks_in_pool():
-    """7단계-A: select 시 pool 에서 삭제하지 않고 inprogress 로 lock."""
-    from osmu_kr.models import KSTATUS_INPROGRESS, normalize_status
+def test_select_records_content_and_locks_via_usage():
+    """v13: select 시 pool 에서 삭제하지 않고 keyword_usages(in_progress) 로 lock.
+
+    keyword.status 는 active 로 유지 — lock 은 keyword_usages 가 책임.
+    """
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, USAGE_IN_PROGRESS, normalize_status,
+    )
     rs = fresh_researcher()
     rs.run_seed("AI ETF")
     pool_before = rs.storage.list_pool()
     pick = pool_before[0]
     rs.select_for_content(pick.keyword_id, title_final="t")
+
+    # keyword 는 풀에 그대로 + status=active
     pool_after = rs.storage.list_pool()
-    # 키워드는 풀에 그대로 남되 status=inprogress
     found = [it for it in pool_after if it.keyword_id == pick.keyword_id]
     assert len(found) == 1
-    assert normalize_status(found[0].status) == KSTATUS_INPROGRESS
-    assert found[0].inprogress_locked_at  # lock 타임스탬프 기록됨
+    assert normalize_status(found[0].status) == KSTATUS_ACTIVE
+
+    # keyword_usages 에 in_progress lock 한 건
+    active_lock = rs.storage.get_active_usage(pick.keyword_id)
+    assert active_lock is not None
+    assert active_lock.status == USAGE_IN_PROGRESS
+    assert active_lock.started_at
+
+    # contents 도 한 건 적재
     contents = rs.storage.list_content()
     assert any(r.keyword_id == pick.keyword_id for r in contents)
 
@@ -1835,129 +1848,358 @@ def test_postgres_storage_round_trip_when_db_available():
 
 
 # ────────────────────────────────────────────────────────
-# [7단계-A] 키워드 상태 모델 재정의 + SafetyLayer
+# [v13-A] keywords.status 단순화 + keyword_usages 활성화
 # ────────────────────────────────────────────────────────
 
-def test_normalize_status_maps_legacy_to_new():
+def test_normalize_status_v13_active_archived_only():
+    """v13: keywords.status 는 active/archived 2단계."""
     from osmu_kr.models import (
-        normalize_status, KSTATUS_CANDIDATE, KSTATUS_PUBLISHED, KSTATUS_ARCHIVED,
+        normalize_status, KSTATUS_ACTIVE, KSTATUS_ARCHIVED,
     )
-    assert normalize_status("golden") == KSTATUS_CANDIDATE
-    assert normalize_status("medium") == KSTATUS_CANDIDATE
-    assert normalize_status("reviving") == KSTATUS_CANDIDATE
-    assert normalize_status("used") == KSTATUS_PUBLISHED
+    # legacy + 7-A 시기 모두 → active 또는 archived 로 매핑
+    assert normalize_status("golden") == KSTATUS_ACTIVE
+    assert normalize_status("medium") == KSTATUS_ACTIVE
+    assert normalize_status("reviving") == KSTATUS_ACTIVE
+    assert normalize_status("used") == KSTATUS_ACTIVE   # v13: 발행 사실은 keyword_usages 가
+    assert normalize_status("candidate") == KSTATUS_ACTIVE
+    assert normalize_status("inprogress") == KSTATUS_ACTIVE
+    assert normalize_status("published") == KSTATUS_ACTIVE
+    assert normalize_status("failed") == KSTATUS_ACTIVE
+    # archive 계열
     assert normalize_status("rejected") == KSTATUS_ARCHIVED
     assert normalize_status("expired") == KSTATUS_ARCHIVED
     assert normalize_status("deprecated") == KSTATUS_ARCHIVED
-    # 새 값은 그대로
-    assert normalize_status("candidate") == "candidate"
-    assert normalize_status("inprogress") == "inprogress"
-    # 알 수 없는 값 → candidate
-    assert normalize_status("zzz") == "candidate"
+    assert normalize_status("archived") == KSTATUS_ARCHIVED
+    # 알 수 없는 값 → active
+    assert normalize_status("zzz") == KSTATUS_ACTIVE
 
 
-def test_safety_layer_transition_happy_path():
-    """candidate → inprogress → published 정상 흐름."""
+def test_safety_layer_v13_lock_lifecycle_happy_path():
+    """v13: start_lock → mark_published 정상 흐름."""
     from osmu_kr.models import (
-        KSTATUS_CANDIDATE, KSTATUS_INPROGRESS, KSTATUS_PUBLISHED,
-        KeywordPoolItem,
+        KSTATUS_ACTIVE, KeywordPoolItem,
+        USAGE_IN_PROGRESS, USAGE_PUBLISHED,
     )
     from osmu_kr.researcher.safety import SafetyLayer
 
     rs = fresh_researcher()
     rs.storage.upsert_pool(KeywordPoolItem(
         keyword_id="0001", seed_keyword="x", keyword="테스트 키워드",
-        status=KSTATUS_CANDIDATE,
+        status=KSTATUS_ACTIVE,
     ))
     safety = SafetyLayer(rs.storage)
+    usage = safety.start_lock("0001", account_id="a", blog_id="b",
+                                contents_id="c-001", note="test")
+    assert usage.status == USAGE_IN_PROGRESS
+    assert usage.started_at
+    assert safety.is_locked("0001")
 
-    after_lock = safety.to_inprogress("0001", reason="test")
-    assert after_lock.status == KSTATUS_INPROGRESS
-    assert after_lock.inprogress_locked_at
-    assert "test" in after_lock.last_status_reason
-
-    after_pub = safety.to_published("0001", reason="ok")
-    assert after_pub.status == KSTATUS_PUBLISHED
-    assert after_pub.published_at
-    assert after_pub.inprogress_locked_at == ""   # lock 자동 해제
+    pub = safety.mark_published(usage.id, contents_id="c-001", note="ok")
+    assert pub.status == USAGE_PUBLISHED
+    assert pub.published_at
+    # lock 해제
+    assert not safety.is_locked("0001")
 
 
-def test_safety_layer_rejects_illegal_transition():
-    """archived 는 어디로도 못 감 (영구 제외)."""
-    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
-    from osmu_kr.researcher.safety import SafetyLayer, TransitionError
+def test_safety_layer_v13_rejects_double_lock():
+    """v13: 같은 keyword 에 in_progress 가 이미 있으면 LockBusy."""
+    from osmu_kr.models import KSTATUS_ACTIVE, KeywordPoolItem
+    from osmu_kr.researcher.safety import LockBusy, SafetyLayer
 
     rs = fresh_researcher()
     rs.storage.upsert_pool(KeywordPoolItem(
-        keyword_id="0002", seed_keyword="x", keyword="아카이브 후보",
-        status=KSTATUS_CANDIDATE,
+        keyword_id="0002", seed_keyword="x", keyword="이중잠금",
+        status=KSTATUS_ACTIVE,
     ))
     safety = SafetyLayer(rs.storage)
-    safety.to_archived("0002", reason="test")
-
+    safety.start_lock("0002")
     try:
-        safety.to_candidate("0002", reason="re-enter")
-        assert False, "TransitionError 가 나야 함"
-    except TransitionError as e:
-        assert "archived" in str(e)
+        safety.start_lock("0002")
+        assert False, "LockBusy 가 나야 함"
+    except LockBusy:
+        pass
 
 
-def test_safety_layer_self_transition_is_noop():
-    """같은 status 로의 전이는 멱등 (no-op)."""
-    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
+def test_safety_layer_v13_failed_unlocks_and_keeps_published_at_empty():
+    """v13: mark_failed 시 lock 즉시 해제. published_at 은 빈 채로 (180일 카운트 미적용)."""
+    from osmu_kr.models import KSTATUS_ACTIVE, KeywordPoolItem, USAGE_FAILED
     from osmu_kr.researcher.safety import SafetyLayer
 
     rs = fresh_researcher()
     rs.storage.upsert_pool(KeywordPoolItem(
-        keyword_id="0003", seed_keyword="x", keyword="self trans",
-        status=KSTATUS_CANDIDATE,
+        keyword_id="0003", seed_keyword="x", keyword="실패",
+        status=KSTATUS_ACTIVE,
     ))
     safety = SafetyLayer(rs.storage)
-    item = safety.to_candidate("0003", reason="noop")
-    assert item.status == KSTATUS_CANDIDATE
+    usage = safety.start_lock("0003")
+    failed = safety.mark_failed(usage.id, note="user_canceled")
+    assert failed.status == USAGE_FAILED
+    assert failed.failed_at
+    assert failed.published_at == ""    # 180일 카운트 미적용
+    assert not safety.is_locked("0003")  # lock 해제
 
 
-def test_recommend_only_returns_candidates_not_inprogress():
-    """7-A: recommend 가 inprogress / published / archived 를 자동 제외."""
-    from osmu_kr.models import KSTATUS_CANDIDATE, KeywordPoolItem
+def test_safety_layer_v13_archive_cancels_active_lock():
+    """v13: archive_keyword 시 활성 lock 자동 failed."""
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KSTATUS_ARCHIVED, KeywordPoolItem,
+        USAGE_FAILED, normalize_status,
+    )
+    from osmu_kr.researcher.safety import SafetyLayer
+
+    rs = fresh_researcher()
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="0004", seed_keyword="x", keyword="아카이브",
+        status=KSTATUS_ACTIVE,
+    ))
+    safety = SafetyLayer(rs.storage)
+    usage = safety.start_lock("0004")
+    safety.archive_keyword("0004", reason="quality_low")
+
+    item = rs.storage.get_pool("0004")
+    assert normalize_status(item.status) == KSTATUS_ARCHIVED
+    # 활성 lock 자동 failed 처리됐는지
+    refreshed = next((u for u in rs.storage.list_usages() if u.id == usage.id), None)
+    assert refreshed is not None
+    assert refreshed.status == USAGE_FAILED
+
+
+def test_recommend_v13_excludes_active_lock_and_published_in_blog():
+    """v13 recommend: in_progress lock 또는 같은 blog 에서 published 된 키워드 제외."""
     from osmu_kr.researcher.safety import SafetyLayer
 
     rs = fresh_researcher()
     rs.run_seed("AI ETF")
     pool = rs.storage.list_pool()
-    assert len(pool) >= 2
-    # 첫 키워드를 inprogress 로 lock
+    assert len(pool) >= 3
+
     safety = SafetyLayer(rs.storage)
-    safety.to_inprogress(pool[0].keyword_id, reason="lock_test")
+    # pool[0] 을 in_progress 로 lock
+    safety.start_lock(pool[0].keyword_id, blog_id="myblog")
+    # pool[1] 을 my_blog 에 published 로 마킹
+    u2 = safety.start_lock(pool[1].keyword_id, blog_id="myblog")
+    safety.mark_published(u2.id)
 
+    # blog_id="myblog" 에 대해 recommend 하면 둘 다 제외돼야 함
     recs = rs.recommend(top_n=10)
+    # recommender 에 blog_id 안 줬으니 published 는 제외 안 됨 — lock 만 빠짐
     rec_ids = {r.keyword_id for r in recs}
-    assert pool[0].keyword_id not in rec_ids   # inprogress 는 추천에서 제외
+    assert pool[0].keyword_id not in rec_ids   # in_progress lock 제외
+
+    # blog_id 명시했을 때
+    from osmu_kr.researcher import recommender as rec_mod
+    recs_with_blog = rec_mod.recommend(rs.storage, rs.cfg, top_n=10, blog_id="myblog")
+    rec_ids2 = {r.keyword_id for r in recs_with_blog}
+    assert pool[0].keyword_id not in rec_ids2  # lock
+    assert pool[1].keyword_id not in rec_ids2  # published_in_blog
 
 
-def test_keyword_pool_item_lifecycle_fields_persist_in_sqlite():
-    """7-A 신규 lifecycle 필드가 SQLite 라운드트립에서 보존되는지."""
-    import os, tempfile
-    from osmu_kr.models import (
-        KSTATUS_PUBLISHED, KeywordPoolItem,
-    )
+# ────────────────────────────────────────────────────────
+# [v13-B] keyword embedding + 씨드 중복 + 어뷰징 쿨다운
+# ────────────────────────────────────────────────────────
+
+def test_keyword_embedding_round_trip_in_sqlite():
+    """v13-B: KeywordPoolItem.embedding_json SQLite 라운드트립."""
+    import json, os, tempfile
+    from osmu_kr.models import KSTATUS_ACTIVE, KeywordPoolItem
     from osmu_kr.storage.sqlite_local import SqliteStorage
 
-    db = os.path.join(tempfile.mkdtemp(prefix="osmu_lifecycle_"), "x.db")
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_kw_emb_"), "x.db")
     s = SqliteStorage(db_path=db)
 
+    emb = [0.01] * 768
     s.upsert_pool(KeywordPoolItem(
-        keyword_id="0010", seed_keyword="x", keyword="lifecycle",
-        status=KSTATUS_PUBLISHED,
-        inprogress_locked_at="", published_at="2026-05-06T10:00:00+0000",
-        failed_at="", archived_at="", account_id="acct-1",
-        last_status_reason="auto-publish ok",
+        keyword_id="0001", seed_keyword="x", keyword="다이어트",
+        status=KSTATUS_ACTIVE,
+        embedding_json=json.dumps(emb),
+        last_evaluated_at="2026-05-06T10:00:00+0000",
     ))
-    loaded = s.get_pool("0010")
-    assert loaded.status == KSTATUS_PUBLISHED
-    assert loaded.published_at == "2026-05-06T10:00:00+0000"
-    assert loaded.account_id == "acct-1"
-    assert "auto-publish" in loaded.last_status_reason
+    loaded = s.get_pool("0001")
+    assert loaded is not None
+    assert json.loads(loaded.embedding_json) == emb
+    assert loaded.last_evaluated_at == "2026-05-06T10:00:00+0000"
+    s.close()
+
+
+def test_keyword_safety_seed_duplicate_finds_similar():
+    """씨드 입력 시 유사도 ≥ 0.93 인 기존 키워드 탐지."""
+    import json
+    from osmu_kr.models import KSTATUS_ACTIVE, KeywordPoolItem
+    from osmu_kr.researcher.keyword_safety import KeywordSafety
+    from osmu_kr.content_generator.embedder import StubEmbedder
+
+    rs = fresh_researcher()
+    embedder = StubEmbedder()
+    ks = KeywordSafety(rs.storage, embedder=embedder)
+
+    # 기존 키워드 등록 + embedding 생성
+    existing = KeywordPoolItem(
+        keyword_id="kw-001", seed_keyword="다이어트",
+        keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE,
+    )
+    ks.ensure_keyword_embedding(existing)
+    rs.storage.upsert_pool(existing)
+
+    # 거의 같은 씨드 입력 — 같은 텍스트라 stub embedding 도 동일 → cosine 1.0
+    matches = ks.find_seed_duplicates("다이어트 식단 추천", threshold=0.9)
+    assert len(matches) == 1
+    assert matches[0].keyword_id == "kw-001"
+    assert matches[0].similarity >= 0.99   # 같은 텍스트 → 거의 1.0
+
+
+def test_keyword_safety_cooldown_blocks_recent_published_similar():
+    """v13-B: 같은 blog 의 최근 published 키워드와 유사도 0.85 이상이면 cooldown 위반."""
+    import json
+    from datetime import timedelta
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KeywordPoolItem, KeywordUsage,
+        USAGE_PUBLISHED, now_utc, to_iso,
+    )
+    from osmu_kr.researcher.keyword_safety import KeywordSafety
+    from osmu_kr.content_generator.embedder import StubEmbedder
+
+    rs = fresh_researcher()
+    embedder = StubEmbedder()
+    ks = KeywordSafety(rs.storage, embedder=embedder)
+
+    # 두 키워드 — 같은 텍스트라 stub embedding 같음 → cosine ≈ 1.0
+    pub_kw = KeywordPoolItem(
+        keyword_id="kw-pub", seed_keyword="다이어트",
+        keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE,
+    )
+    cand_kw = KeywordPoolItem(
+        keyword_id="kw-cand", seed_keyword="다이어트",
+        keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE,
+    )
+    ks.ensure_keyword_embedding(pub_kw)
+    ks.ensure_keyword_embedding(cand_kw)
+    rs.storage.upsert_pool(pub_kw)
+    rs.storage.upsert_pool(cand_kw)
+
+    # 1일 전 발행 이력 등록
+    one_day_ago = to_iso(now_utc() - timedelta(days=1))
+    rs.storage.upsert_usage(KeywordUsage(
+        id="u-001", keyword_id="kw-pub", blog_id="myblog",
+        contents_id="c-001", status=USAGE_PUBLISHED,
+        started_at=one_day_ago, published_at=one_day_ago,
+    ))
+
+    # 후보 키워드의 cooldown 체크
+    conflict = ks.check_abuse_cooldown(
+        "kw-cand", threshold=0.85, days=3.0, blog_id="myblog",
+    )
+    assert conflict is not None
+    assert conflict.match.keyword_id == "kw-pub"
+    assert conflict.match.similarity >= 0.85
+
+
+def test_keyword_safety_cooldown_passes_when_old_enough():
+    """4일 전 발행이면 3일 cooldown 안 걸려야 함."""
+    import json
+    from datetime import timedelta
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KeywordPoolItem, KeywordUsage,
+        USAGE_PUBLISHED, now_utc, to_iso,
+    )
+    from osmu_kr.researcher.keyword_safety import KeywordSafety
+    from osmu_kr.content_generator.embedder import StubEmbedder
+
+    rs = fresh_researcher()
+    ks = KeywordSafety(rs.storage, embedder=StubEmbedder())
+
+    a = KeywordPoolItem(keyword_id="kw-a", seed_keyword="x",
+                          keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE)
+    b = KeywordPoolItem(keyword_id="kw-b", seed_keyword="x",
+                          keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE)
+    ks.ensure_keyword_embedding(a)
+    ks.ensure_keyword_embedding(b)
+    rs.storage.upsert_pool(a)
+    rs.storage.upsert_pool(b)
+
+    four_days_ago = to_iso(now_utc() - timedelta(days=4))
+    rs.storage.upsert_usage(KeywordUsage(
+        id="u-x", keyword_id="kw-a", blog_id="myblog",
+        contents_id="c-x", status=USAGE_PUBLISHED,
+        started_at=four_days_ago, published_at=four_days_ago,
+    ))
+
+    conflict = ks.check_abuse_cooldown("kw-b", threshold=0.85, days=3.0,
+                                        blog_id="myblog")
+    assert conflict is None  # 4일 > 3일 → 통과
+
+
+def test_safety_layer_start_lock_raises_on_cooldown_violation():
+    """v13-B: SafetyLayer.start_lock 이 cooldown 위반 시 CooldownViolation 발생."""
+    from datetime import timedelta
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KeywordPoolItem, KeywordUsage,
+        USAGE_PUBLISHED, now_utc, to_iso,
+    )
+    from osmu_kr.researcher.keyword_safety import KeywordSafety
+    from osmu_kr.researcher.safety import CooldownViolation, SafetyLayer
+    from osmu_kr.content_generator.embedder import StubEmbedder
+
+    rs = fresh_researcher()
+    ks = KeywordSafety(rs.storage, embedder=StubEmbedder())
+
+    pub = KeywordPoolItem(keyword_id="kw-p", seed_keyword="x",
+                            keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE)
+    cand = KeywordPoolItem(keyword_id="kw-c", seed_keyword="x",
+                             keyword="다이어트 식단 추천", status=KSTATUS_ACTIVE)
+    ks.ensure_keyword_embedding(pub)
+    ks.ensure_keyword_embedding(cand)
+    rs.storage.upsert_pool(pub)
+    rs.storage.upsert_pool(cand)
+
+    one_day_ago = to_iso(now_utc() - timedelta(days=1))
+    rs.storage.upsert_usage(KeywordUsage(
+        id="u-001", keyword_id="kw-p", blog_id="myblog",
+        contents_id="c-001", status=USAGE_PUBLISHED,
+        started_at=one_day_ago, published_at=one_day_ago,
+    ))
+
+    safety = SafetyLayer(rs.storage)
+    try:
+        safety.start_lock("kw-c", blog_id="myblog")
+        assert False, "CooldownViolation 이 나야 함"
+    except CooldownViolation as e:
+        assert "cooldown" in str(e).lower()
+
+    # skip_cooldown=True 면 통과
+    usage = safety.start_lock("kw-c", blog_id="myblog", skip_cooldown=True)
+    assert usage.id
+
+
+def test_keyword_usages_round_trip_in_sqlite():
+    """v13 keyword_usages SQLite CRUD."""
+    import os, tempfile
+    from osmu_kr.models import KeywordUsage, USAGE_IN_PROGRESS, USAGE_PUBLISHED
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_usage_"), "x.db")
+    s = SqliteStorage(db_path=db)
+
+    u = KeywordUsage(
+        keyword_id="kw-001", account_id="a1", blog_id="myblog",
+        contents_id="c-001", status=USAGE_IN_PROGRESS,
+    )
+    s.upsert_usage(u)
+    assert u.id   # 자동 부여
+
+    fetched = s.get_active_usage("kw-001")
+    assert fetched is not None
+    assert fetched.status == USAGE_IN_PROGRESS
+
+    # published 로 전이
+    fetched.status = USAGE_PUBLISHED
+    fetched.published_at = "2026-05-06T10:00:00+0000"
+    s.upsert_usage(fetched)
+    # 더 이상 활성 lock 아님
+    assert s.get_active_usage("kw-001") is None
+    # 전체 목록
+    all_usages = s.list_usages_by_keyword("kw-001")
+    assert len(all_usages) == 1
+    assert all_usages[0].status == USAGE_PUBLISHED
     s.close()
 
 
@@ -2047,7 +2289,7 @@ TESTS = [
     test_expander_includes_seed_and_dedups,
     test_alchemy_produces_distinct_variants,
     test_run_seed_creates_pool_items,
-    test_select_records_content_and_locks_in_pool,
+    test_select_records_content_and_locks_via_usage,
     test_seed_cooldown_blocks_same_seed,
     test_prune_removes_expired,
     test_xlsx_storage_round_trip,
@@ -2125,13 +2367,20 @@ TESTS = [
     test_postgres_storage_imports_without_db_url,
     test_postgres_factory_raises_without_url,
     test_postgres_storage_round_trip_when_db_available,
-    # ── [7단계-A] 키워드 상태 모델 + SafetyLayer ──
-    test_normalize_status_maps_legacy_to_new,
-    test_safety_layer_transition_happy_path,
-    test_safety_layer_rejects_illegal_transition,
-    test_safety_layer_self_transition_is_noop,
-    test_recommend_only_returns_candidates_not_inprogress,
-    test_keyword_pool_item_lifecycle_fields_persist_in_sqlite,
+    # ── [v13-A] 키워드 상태 단순화 + keyword_usages ──
+    test_normalize_status_v13_active_archived_only,
+    test_safety_layer_v13_lock_lifecycle_happy_path,
+    test_safety_layer_v13_rejects_double_lock,
+    test_safety_layer_v13_failed_unlocks_and_keeps_published_at_empty,
+    test_safety_layer_v13_archive_cancels_active_lock,
+    test_recommend_v13_excludes_active_lock_and_published_in_blog,
+    test_keyword_usages_round_trip_in_sqlite,
+    # ── [v13-B] keyword embedding + 씨드 중복 + 어뷰징 쿨다운 ──
+    test_keyword_embedding_round_trip_in_sqlite,
+    test_keyword_safety_seed_duplicate_finds_similar,
+    test_keyword_safety_cooldown_blocks_recent_published_similar,
+    test_keyword_safety_cooldown_passes_when_old_enough,
+    test_safety_layer_start_lock_raises_on_cooldown_violation,
 ]
 
 
