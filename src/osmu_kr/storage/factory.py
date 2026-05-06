@@ -39,11 +39,21 @@ def _build_local(cfg: Config) -> BaseStorage:
     return LocalCsvStorage(data_dir=cfg.local_data_dir)
 
 
+def _build_sqlite(cfg: Config) -> BaseStorage:
+    """SQLite v1 백엔드 — config.sqlite_db_path (없으면 ./osmu.db)."""
+    from .sqlite_local import SqliteStorage
+    db_path = getattr(cfg, "sqlite_db_path", None) or "./osmu.db"
+    return SqliteStorage(db_path=db_path)
+
+
 def build_storage(cfg: Config) -> BaseStorage:
     backend = cfg.resolved_backend()
 
     if backend == "auto":
         backend = "mirror" if (cfg.has_google_credentials and cfg.sheet_id) else "local"
+
+    if backend == "sqlite":
+        return _build_sqlite(cfg)
 
     if backend == "sheets":
         sh = _try_build_sheets(cfg)

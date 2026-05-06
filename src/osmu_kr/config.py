@@ -51,6 +51,9 @@ class Config:
     local_format: str = field(default_factory=lambda: _s("OSMU_LOCAL_FORMAT", "xlsx"))
     local_xlsx_filename: str = field(default_factory=lambda: _s("OSMU_LOCAL_XLSX", "osmu_workbook.xlsx"))
 
+    # SQLite v1 — OSMU_STORAGE_BACKEND=sqlite 일 때 사용
+    sqlite_db_path: str = field(default_factory=lambda: _s("OSMU_SQLITE_PATH", "./osmu.db"))
+
     evaluator: str = field(default_factory=lambda: _s("OSMU_EVALUATOR", "heuristic"))
 
     pool_max_size: int = field(default_factory=lambda: _i("OSMU_POOL_MAX_SIZE", 200))

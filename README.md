@@ -161,16 +161,17 @@ commercial_elements  — { recommendations, comparison_points, cta_candidates }
 
 ---
 
-## 💾 저장 모드 4종
+## 💾 저장 모드 5종
 
 | 모드 | 동작 | 권장 상황 |
 |---|---|---|
 | `local` | 내 컴퓨터(.xlsx 또는 .csv) 단독 | 혼자 사용, 오프라인 |
 | `sheets` | Google Sheets 단독 (실시간 호출) | 팀 협업 우선 |
-| `mirror` ⭐ | 로컬 + Sheets 양방향 동기화 | **권장** — 둘 다 활용 |
+| `mirror` ⭐ | 로컬 + Sheets 양방향 동기화 | 단독·팀 둘 다 |
+| `sqlite` 🆕 | 단일 .db 파일 — v9 spec 5개 테이블 | **권장** — 풍부 필드(JSON)·트랜잭션·인덱스 |
 | `auto` | 자격증명 있으면 mirror, 없으면 local | 별 설정 없이 |
 
-설정 화면에서 라디오 한 번이면 전환된다. SQLite 도입은 다음 단계에서 진행 (v1: 단독 SQLite, v2+: PostgreSQL + pgvector).
+`OSMU_STORAGE_BACKEND=sqlite`, `OSMU_SQLITE_PATH=./osmu.db`. 5개 테이블(`keywords / keyword_evaluations / keyword_usages / accounts / contents`)이 첫 호출 시 자동 생성된다. v2+ PostgreSQL + pgvector 마이그레이션 시 컬럼명/타입을 그대로 사용할 수 있도록 v9 spec 명을 따른다.
 
 ---
 
@@ -182,8 +183,9 @@ commercial_elements  — { recommendations, comparison_points, cta_candidates }
 
 | 변수 | 기본값 | 의미 |
 |---|---|---|
-| `OSMU_STORAGE_BACKEND` | `auto` | `auto` / `mirror` / `sheets` / `local` |
+| `OSMU_STORAGE_BACKEND` | `auto` | `auto` / `mirror` / `sheets` / `local` / `sqlite` |
 | `OSMU_LOCAL_FORMAT` | `xlsx` | `xlsx` / `csv` |
+| `OSMU_SQLITE_PATH` | `./osmu.db` | SQLite 파일 경로 (`OSMU_STORAGE_BACKEND=sqlite` 일 때) |
 | `OSMU_EVALUATOR` | `heuristic` | `heuristic` / `naver_golden` / `naver_ads` |
 | `OSMU_POOL_MAX_SIZE` | `200` | 풀 최대 크기 |
 | `OSMU_REVIVAL_DAYS` | `30` | 재평가 주기(일) |
@@ -330,8 +332,8 @@ GitHub Actions(`tests.yml`)는 push/PR마다 Python 3.10/3.11/3.12 + macOS-lates
 - [x] 0단계 — KeywordContext + interpret() (룰 + Claude 보강)
 - [x] 2-1단계 — Phase 1 청사진 + summary_embedding + commercial_elements
 - [x] 2-2단계 — Phase 2 fact 매핑 + 도메인 관련성 + 최소 facts 게이트
-- [ ] **다음** — SQLite 영속화 (v9 5개 테이블: keywords / keyword_evaluations / keyword_usages / accounts / contents)
-- [ ] contents_maker 단순화 — Writer가 blueprint·facts·commercial을 충실히 HTML로 옮기는 역할로 축소
+- [x] 5단계 — SQLite 영속화 (v9 5개 테이블 + ContentRecord 풍부 필드 JSON 컬럼)
+- [ ] **다음** — contents_maker 단순화 — Writer가 blueprint·facts·commercial을 충실히 HTML로 옮기는 역할로 축소
 - [ ] checker — 자기잠식·표절·구조 두 단계 게이트
 - [ ] publisher — 티스토리 Playwright + 어뷰징 게이트
 - [ ] PostgreSQL + pgvector — 임베딩 기반 자기잠식 검색을 DB 안에서

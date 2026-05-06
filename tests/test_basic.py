@@ -1493,6 +1493,222 @@ def test_phase2_flags_insufficient_facts():
     assert any(i.startswith("total_facts_too_low") for i in res.issues)
 
 
+# ────────────────────────────────────────────────────────
+# [5단계] SQLite 영속화 — v9 spec 5개 테이블
+# ────────────────────────────────────────────────────────
+
+def test_sqlite_storage_pool_round_trip():
+    """SqliteStorage — KeywordPoolItem upsert / list / delete 라운드트립."""
+    import os, tempfile
+    from osmu_kr.models import KeywordPoolItem
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db_path = os.path.join(tempfile.mkdtemp(prefix="osmu_sqlite_"), "test.db")
+    s = SqliteStorage(db_path=db_path)
+
+    item = KeywordPoolItem(
+        keyword_id="0001", seed_keyword="다이어트", keyword="직장인 다이어트 식단",
+        score=82.5, status="golden", grade="황금", profile="롱테일",
+        weak_points="", is_alchemy="Y", original_keyword="다이어트", revival_count=1,
+    )
+    s.upsert_pool(item)
+    pool = s.list_pool()
+    assert len(pool) == 1
+    assert pool[0].keyword == "직장인 다이어트 식단"
+    assert pool[0].grade == "황금"
+    assert pool[0].is_alchemy == "Y"
+    assert pool[0].revival_count == 1
+
+    # upsert 갱신
+    item.score = 90.0
+    s.upsert_pool(item)
+    assert s.list_pool()[0].score == 90.0
+
+    # delete
+    assert s.delete_pool("0001") is True
+    assert s.list_pool() == []
+    s.close()
+
+
+def test_sqlite_storage_content_with_v9_fields_round_trip():
+    """SqliteStorage — ContentRecord 의 v9 풍부 필드(JSON 컬럼)도 보존."""
+    import json, os, tempfile
+    from osmu_kr.models import ContentRecord
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db_path = os.path.join(tempfile.mkdtemp(prefix="osmu_sqlite_"), "test.db")
+    s = SqliteStorage(db_path=db_path)
+
+    target_reader = {"persona": "DBD 초보", "knowledge_level": "초보",
+                      "primary_intent": "공략"}
+    paragraphs = [
+        {"section_index": 1, "title": "DBD 가 어떤 게임인지",
+         "paragraph_type": "llm_generated", "description": "장르"},
+        {"section_index": 2, "title": "초보 추천 캐릭터",
+         "paragraph_type": "fact_based", "description": "비교",
+         "facts_required": ["메그", "드와이트"]},
+    ]
+    facts = {"2": [{"fact_text": "메그는 빠른 달리기로 초보에 추천", "source_url": "https://x"}]}
+    embedding = [0.01] * 768
+    commercial = {"recommendations": ["메그", "드와이트"],
+                   "comparison_points": ["속도 비교"],
+                   "cta_candidates": ["빌드 더 보기"]}
+
+    rec = ContentRecord(
+        id="042",
+        keyword="데드바이데이라이트 공략",
+        title="DBD 초보 공략",
+        status="generated",
+        refined_post="<h1>DBD</h1>",
+        target_reader_json=json.dumps(target_reader, ensure_ascii=False),
+        paragraph_blueprint_json=json.dumps(paragraphs, ensure_ascii=False),
+        normalized_sources_json=json.dumps(facts, ensure_ascii=False),
+        summary_embedding_json=json.dumps(embedding, ensure_ascii=False),
+        commercial_elements_json=json.dumps(commercial, ensure_ascii=False),
+        publish_attempt_count=2,
+    )
+    s.append_content(rec)
+
+    loaded = s.list_content()
+    assert len(loaded) == 1
+    r = loaded[0]
+    assert r.id == "042"
+    assert r.title == "DBD 초보 공략"
+    assert r.publish_attempt_count == 2
+    # JSON 컬럼 라운드트립
+    assert json.loads(r.target_reader_json)["primary_intent"] == "공략"
+    assert json.loads(r.paragraph_blueprint_json)[1]["paragraph_type"] == "fact_based"
+    assert json.loads(r.normalized_sources_json)["2"][0]["source_url"] == "https://x"
+    assert len(json.loads(r.summary_embedding_json)) == 768
+    assert "메그" in json.loads(r.commercial_elements_json)["recommendations"]
+
+    # update_content in-place
+    assert s.update_content("042", status="발행완료", publish_attempt_count=3) is True
+    updated = s.list_content()[0]
+    assert updated.status == "발행완료"
+    assert updated.publish_attempt_count == 3
+    assert updated.id == "042"           # 보호 필드 유지
+
+    # delete
+    assert s.delete_content("042") is True
+    assert s.list_content() == []
+    s.close()
+
+
+def test_sqlite_storage_history_round_trip():
+    import os, tempfile
+    from osmu_kr.models import ResearchHistoryRecord
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db_path = os.path.join(tempfile.mkdtemp(prefix="osmu_sqlite_"), "test.db")
+    s = SqliteStorage(db_path=db_path)
+
+    s.append_history(ResearchHistoryRecord(
+        keyword="적금 추천", grade="황금", total_score=88.0, profile="일반",
+        evaluator="naver_golden",
+    ))
+    rows = s.list_history()
+    assert len(rows) == 1
+    assert rows[0].keyword == "적금 추천"
+    assert rows[0].grade == "황금"
+    s.close()
+
+
+def test_factory_builds_sqlite_when_backend_is_sqlite():
+    import os, tempfile
+    from osmu_kr import Config
+    from osmu_kr.storage.factory import build_storage
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    tmp = tempfile.mkdtemp(prefix="osmu_factory_sqlite_")
+    saved_be = os.environ.get("OSMU_STORAGE_BACKEND")
+    saved_db = os.environ.get("OSMU_SQLITE_PATH")
+    os.environ["OSMU_STORAGE_BACKEND"] = "sqlite"
+    os.environ["OSMU_SQLITE_PATH"] = os.path.join(tmp, "fac.db")
+    try:
+        s = build_storage(Config())
+    finally:
+        if saved_be is None:
+            os.environ.pop("OSMU_STORAGE_BACKEND", None)
+        else:
+            os.environ["OSMU_STORAGE_BACKEND"] = saved_be
+        if saved_db is None:
+            os.environ.pop("OSMU_SQLITE_PATH", None)
+        else:
+            os.environ["OSMU_SQLITE_PATH"] = saved_db
+
+    assert isinstance(s, SqliteStorage)
+    # 라이브 DB 파일 만들어졌는지
+    assert os.path.isfile(os.path.join(tmp, "fac.db"))
+
+
+def test_generator_persists_phase1_phase2_payload_to_sqlite():
+    """Generator → SQLite 저장 시 phase1/phase2 산출물이 JSON 컬럼에 들어가는지."""
+    import json, os, tempfile
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseWriter, BaseImageProvider, CrawledPage, ImageItem,
+    )
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    GAME = (
+        "데드바이데이라이트는 4vs1 비대칭 호러 게임으로 생존자가 발전기를 수리해 탈출합니다. "
+        "메그 토마스는 빠른 달리기로 초보자에 추천되는 생존자 캐릭터입니다. "
+        "킬러는 후크에 매달아 탈락시키며 맵별로 동선이 다릅니다. "
+        "발전기 본딩은 초보가 자주 죽는 패턴이라 분산 수리가 안전합니다."
+    )
+
+    class C(BaseCrawler):
+        name="c"
+        def search(self, q, *, limit=5): return [f"https://w/{i}" for i in range(limit)]
+        def scrape(self, url): return CrawledPage(url=url, title="t", content=GAME)
+    class W(BaseWriter):
+        name="w"
+        def write(self, kw, raw, *, sources=None, images=None, tone="전문적"):
+            return f"<h1>{kw}</h1><h2>본문</h2><p>{raw[:60]}</p><h2>마무리</h2><p>요약</p>"
+    class I(BaseImageProvider):
+        name="i"
+        def search(self, q, *, count=3, slug="", alt_keyword=""):
+            return [ImageItem(url=f"https://i/{i}.jpg", filename=f"x-{i}.jpg",
+                                alt="a", source="s") for i in range(1, count+1)]
+
+    tmp = tempfile.mkdtemp(prefix="osmu_gen_sqlite_")
+    db_path = os.path.join(tmp, "g.db")
+    storage = SqliteStorage(db_path=db_path)
+
+    saved = os.environ.get("OSMU_EMBEDDER")
+    os.environ["OSMU_EMBEDDER"] = "stub"
+    try:
+        g = Generator(crawler=C(), writer=W(), images=I(), storage=storage,
+                      config=GeneratorConfig(min_h2_sections=1, min_paragraphs=1,
+                                              min_images=0))
+        result = g.generate("데드바이데이라이트 공략", save=True)
+    finally:
+        if saved is None:
+            os.environ.pop("OSMU_EMBEDDER", None)
+        else:
+            os.environ["OSMU_EMBEDDER"] = saved
+
+    assert result.record_id
+    rec = storage.list_content()[0]
+    # v9 필드 모두 채워졌는지 확인
+    assert rec.title  # blueprint.title
+    assert rec.target_reader_json
+    assert rec.paragraph_blueprint_json
+    assert rec.commercial_elements_json
+    assert rec.summary_embedding_json
+    assert rec.normalized_sources_json
+    # JSON 파싱 가능
+    tr = json.loads(rec.target_reader_json)
+    assert tr.get("primary_intent")
+    pb = json.loads(rec.paragraph_blueprint_json)
+    assert isinstance(pb, list) and len(pb) >= 3
+    emb = json.loads(rec.summary_embedding_json)
+    assert len(emb) == 768
+    storage.close()
+
+
 def test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back():
     """LLM 이 일반 템플릿(개념/활용/결론) 을 만들어도 phase1 이 reject 하고 룰 폴백."""
     import os
@@ -1647,6 +1863,12 @@ TESTS = [
     test_phase2_flags_domain_mismatch_on_off_topic_facts,
     test_phase2_flags_insufficient_facts,
     test_collector_phase1_rejects_generic_llm_blueprint_and_falls_back,
+    # ── [5단계] SQLite 영속화 ──
+    test_sqlite_storage_pool_round_trip,
+    test_sqlite_storage_content_with_v9_fields_round_trip,
+    test_sqlite_storage_history_round_trip,
+    test_factory_builds_sqlite_when_backend_is_sqlite,
+    test_generator_persists_phase1_phase2_payload_to_sqlite,
 ]
 
 

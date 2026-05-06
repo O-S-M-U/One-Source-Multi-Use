@@ -218,12 +218,26 @@ class ContentRecord:
     image_urls: str = ""
     error_log: str = ""
     note: str = ""
+    # ── v9 spec 풍부 필드 (5단계 신규) ──
+    # Phase 1·2 산출물 — 모두 JSON 직렬화 텍스트로 저장 (csv/xlsx/sheets 호환)
+    title: str = ""                         # v9: h1 제목 (title_final 과 분리)
+    target_reader_json: str = ""            # TargetReader JSON
+    paragraph_blueprint_json: str = ""      # List[ParagraphBlock] JSON
+    normalized_sources_json: str = ""       # Dict[section_index → List[FactItem]] JSON
+    summary_embedding_json: str = ""        # List[float] JSON (768-dim)
+    commercial_elements_json: str = ""      # CommercialElements JSON
+    publish_attempt_count: int = 0
 
     HEADER = [
         "id", "keyword", "seed_keyword", "keyword_id", "original_source",
         "status", "title_final", "platform_url",
         "created_at", "published_at", "raw_content", "refined_post",
         "image_urls", "error_log", "note",
+        # v9 풍부 필드 — 기존 csv/xlsx 후방호환 위해 끝에 추가
+        "title",
+        "target_reader_json", "paragraph_blueprint_json",
+        "normalized_sources_json", "summary_embedding_json",
+        "commercial_elements_json", "publish_attempt_count",
     ]
 
     def to_row(self) -> list:
@@ -234,4 +248,14 @@ class ContentRecord:
     def from_row(cls, row: list) -> "ContentRecord":
         padded = list(row) + [""] * (len(cls.HEADER) - len(row))
         d = dict(zip(cls.HEADER, padded))
-        return cls(**{k: str(v) if v is not None else "" for k, v in d.items()})
+        # publish_attempt_count 만 int 로 변환, 나머지는 str
+        out = {}
+        for k, v in d.items():
+            if k == "publish_attempt_count":
+                try:
+                    out[k] = int(float(v or 0))
+                except (TypeError, ValueError):
+                    out[k] = 0
+            else:
+                out[k] = str(v) if v is not None else ""
+        return cls(**out)
