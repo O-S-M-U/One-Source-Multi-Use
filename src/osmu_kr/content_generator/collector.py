@@ -101,12 +101,15 @@ class Collector:
 
     def __init__(self, crawler: BaseCrawler, *,
                  min_sources: int = 3, search_limit: int = 5,
-                 embedder: Optional[BaseEmbedder] = None):
+                 embedder: Optional[BaseEmbedder] = None,
+                 storage=None):
         self.crawler = crawler
         self.min_sources = min_sources
         self.search_limit = search_limit
         # 임베딩은 Phase 1 에서만 쓰므로 lazy 초기화 (호출 시 부여)
         self._embedder = embedder
+        # v13-G: 자기잠식 경고를 위해 storage 연결 (옵션)
+        self._storage = storage
 
     @property
     def embedder(self) -> BaseEmbedder:
@@ -170,9 +173,56 @@ class Collector:
                      raw_signals={**bp.raw_signals,
                                    "embedder": getattr(self.embedder, "name", "?")})
 
+        # v13-G: 자기잠식 1차 스크리닝 — summary_embedding ≥ similarity_warning_threshold
+        # 기존 published 글들의 summary_embedding 과 cosine 비교.
+        if vec:
+            warnings = self._self_cannibalization_warnings(vec, bp.keyword)
+            if warnings:
+                bp = replace(bp, raw_signals={
+                    **bp.raw_signals,
+                    "self_cannibalization_warnings": ";".join(
+                        f"id={w['id']}:sim={w['similarity']:.3f}" for w in warnings[:3]
+                    ),
+                })
+                log.warning(
+                    "[collector.phase1] 자기잠식 경고 %d건 (>=0.75): top=%s",
+                    len(warnings),
+                    f"id={warnings[0]['id']} sim={warnings[0]['similarity']:.3f}",
+                )
+
         log.info("[collector.phase1] 완료: %s embedding_dim=%s",
                   bp.short(), len(vec) if vec else "None")
         return bp
+
+    # ── v13-G: 자기잠식 경고 헬퍼 ──────────────────────
+    def _self_cannibalization_warnings(self, new_embedding,
+                                         keyword: str,
+                                         *, threshold: float = 0.75,
+                                         top_k: int = 5):
+        """기존 contents 의 summary_embedding 과 cosine 비교 → threshold 이상 매치 반환."""
+        from .embedder import cosine
+        # storage 가 없으면 스킵
+        storage = getattr(self, "_storage", None)
+        if storage is None:
+            return []
+        warnings = []
+        for rec in storage.list_content():
+            emb_json = getattr(rec, "summary_embedding_json", "") or ""
+            if not emb_json:
+                continue
+            try:
+                import json as _json
+                vec = _json.loads(emb_json)
+                if not isinstance(vec, list) or len(vec) != len(new_embedding):
+                    continue
+                sim = cosine(new_embedding, vec)
+            except Exception:
+                continue
+            if sim >= threshold:
+                warnings.append({"id": rec.id, "keyword": rec.keyword,
+                                  "similarity": sim})
+        warnings.sort(key=lambda w: w["similarity"], reverse=True)
+        return warnings[:top_k]
 
     def collect(self, keyword: Union[str, KeywordContext],
                 *, limit: int = 3) -> RawContent:

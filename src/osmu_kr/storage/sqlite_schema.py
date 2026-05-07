@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS keyword_usages (
 DDL_ACCOUNTS = """
 CREATE TABLE IF NOT EXISTS accounts (
     id                TEXT    PRIMARY KEY,
+    platform          TEXT    NOT NULL DEFAULT 'tistory',
     blog_id           TEXT    NOT NULL,
     login_id          TEXT    NOT NULL DEFAULT '',
     cookie_path       TEXT    NOT NULL DEFAULT '',
@@ -172,11 +173,19 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 """
 
+DDL_CONFIG = """
+CREATE TABLE IF NOT EXISTS config (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
     """모든 DDL 적용 — 멱등. 새 DB 또는 기존 DB 어디서든 안전."""
     cur = conn.cursor()
-    for ddl in (DDL_META, DDL_KEYWORDS, DDL_KEYWORD_EVALUATIONS,
+    for ddl in (DDL_META, DDL_CONFIG, DDL_KEYWORDS, DDL_KEYWORD_EVALUATIONS,
                 DDL_KEYWORD_USAGES, DDL_ACCOUNTS, DDL_CONTENTS):
         cur.execute(ddl)
     for idx in DDL_INDEXES:

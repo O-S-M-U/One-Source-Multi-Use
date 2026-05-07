@@ -99,21 +99,34 @@ USAGE_ALLOWED_TRANSITIONS = {
     USAGE_FAILED:      set(),
 }
 
+# ── 등급 — v13 spec 부스러기/강철/황금 ────────────────────
+# v13: 부스러기(0~45) / 강철(46~59) / 황금(60+).
+# 60 은 keyword.golden_threshold (config), 45 는 keyword.pool_eviction_score_threshold (config).
 GRADE_GOLDEN = "황금"
-GRADE_GOOD = "좋은"
-GRADE_MEDIUM = "보통"
-GRADE_FAIL = "미달"
-GRADE_ORDER = {GRADE_GOLDEN: 4, GRADE_GOOD: 3, GRADE_MEDIUM: 2, GRADE_FAIL: 1}
+GRADE_STEEL = "강철"        # v13 신규
+GRADE_CRUMB = "부스러기"     # v13 신규
+GRADE_ORDER = {GRADE_GOLDEN: 3, GRADE_STEEL: 2, GRADE_CRUMB: 1}
+
+# legacy 호환 alias — 기존 코드/테스트가 import 하던 이름
+GRADE_GOOD = GRADE_STEEL    # 좋은 → 강철
+GRADE_MEDIUM = GRADE_STEEL  # 보통 → 강철
+GRADE_FAIL = GRADE_CRUMB    # 미달 → 부스러기
 
 
-def grade_from_score(score: float) -> str:
-    if score >= 80:
+def grade_from_score(score: float, *,
+                     golden_threshold: float = 60.0,
+                     crumb_upper: float = 45.0) -> str:
+    """v13 등급 매핑.
+
+    - score >= golden_threshold (default 60) → 황금
+    - crumb_upper < score < golden_threshold (45..59) → 강철
+    - score <= crumb_upper (45 이하) → 부스러기
+    """
+    if score >= golden_threshold:
         return GRADE_GOLDEN
-    if score >= 60:
-        return GRADE_GOOD
-    if score >= 40:
-        return GRADE_MEDIUM
-    return GRADE_FAIL
+    if score > crumb_upper:
+        return GRADE_STEEL
+    return GRADE_CRUMB
 
 
 @dataclass
@@ -276,6 +289,31 @@ class KeywordUsage:
     def is_active_lock(self) -> bool:
         """in_progress 상태에서 잠금 활성 여부."""
         return self.status == USAGE_IN_PROGRESS
+
+
+@dataclass
+class Account:
+    """v13 accounts 테이블 — Tistory 등 발행 플랫폼 계정.
+
+    필드:
+      · id                 : 계정 고유 ID
+      · platform           : "tistory" (v3 멀티 플랫폼 대비)
+      · blog_id            : 블로그 식별자 (자기잠식 단위)
+      · login_id           : 로그인 이메일/ID
+      · cookie_path        : Playwright 세션 쿠키 파일 경로
+      · cookie_updated_at  : 쿠키 마지막 갱신 시각
+      · is_active          : 활성 여부 (1/0)
+      · note               : 메모
+    """
+    id: str
+    platform: str = "tistory"
+    blog_id: str = ""
+    login_id: str = ""
+    cookie_path: str = ""
+    cookie_updated_at: str = ""
+    is_active: int = 1
+    note: str = ""
+    created_at: str = field(default_factory=lambda: to_iso(now_utc()))
 
 
 @dataclass

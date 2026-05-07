@@ -18,7 +18,7 @@ import logging
 from typing import Any, List, Optional, Tuple
 
 from ..models import (
-    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+    Account, ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
     USAGE_IN_PROGRESS, normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
@@ -606,6 +606,97 @@ class PostgresStorage(BaseStorage):
                 (keyword_id,),
             )
             return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    # ── v13-F accounts 테이블 ──────────────────────────
+    _ACCOUNT_COLS = (
+        "id, platform, blog_id, login_id, cookie_path, "
+        "cookie_updated_at, is_active, note, created_at"
+    )
+
+    @staticmethod
+    def _row_to_account(row: tuple) -> Account:
+        (id_, platform, blog_id, login_id, cookie_path,
+         cookie_updated_at, is_active, note, created_at) = row
+        return Account(
+            id=id_, platform=platform or "tistory", blog_id=blog_id or "",
+            login_id=login_id or "", cookie_path=cookie_path or "",
+            cookie_updated_at=cookie_updated_at or "",
+            is_active=int(is_active or 0), note=note or "",
+            created_at=created_at,
+        )
+
+    def list_accounts(self) -> List[Account]:
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT {self._ACCOUNT_COLS} FROM accounts ORDER BY created_at")
+            return [self._row_to_account(r) for r in cur.fetchall()]
+
+    def get_account(self, account_id: str) -> Optional[Account]:
+        if not account_id:
+            return None
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT {self._ACCOUNT_COLS} FROM accounts WHERE id = %s",
+                        (account_id,))
+            row = cur.fetchone()
+            return self._row_to_account(row) if row else None
+
+    def upsert_account(self, account: Account) -> None:
+        if not account.id:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM accounts")
+                n = cur.fetchone()[0] or 0
+            account.id = f"acc{n + 1:04d}"
+        if not account.created_at:
+            account.created_at = to_iso(now_utc())
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO accounts ({self._ACCOUNT_COLS})
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                  platform=EXCLUDED.platform,
+                  blog_id=EXCLUDED.blog_id,
+                  login_id=EXCLUDED.login_id,
+                  cookie_path=EXCLUDED.cookie_path,
+                  cookie_updated_at=EXCLUDED.cookie_updated_at,
+                  is_active=EXCLUDED.is_active,
+                  note=EXCLUDED.note
+                """,
+                (account.id, account.platform, account.blog_id,
+                 account.login_id, account.cookie_path,
+                 account.cookie_updated_at, int(account.is_active),
+                 account.note, account.created_at),
+            )
+        self.conn.commit()
+
+    # ── v13-D config 테이블 ────────────────────────────
+    def get_config(self, key: str) -> Optional[str]:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT value FROM config WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def set_config(self, key: str, value: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO config(key, value, updated_at) VALUES(%s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                  value=EXCLUDED.value, updated_at=EXCLUDED.updated_at
+                """,
+                (key, str(value), to_iso(now_utc())),
+            )
+        self.conn.commit()
+
+    def delete_config(self, key: str) -> bool:
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM config WHERE key = %s", (key,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def list_config(self) -> List[tuple]:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM config ORDER BY key")
+            return list(cur.fetchall())
 
     def upsert_usage(self, usage: KeywordUsage) -> None:
         if not usage.id:

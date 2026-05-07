@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import List, Optional
 
 from ..models import (
-    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+    Account, ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
 )
 
 
@@ -108,6 +108,58 @@ class BaseStorage(ABC):
 
     def list_usages_by_keyword(self, keyword_id: str) -> List[KeywordUsage]:
         return [u for u in self.list_usages() if u.keyword_id == keyword_id]
+
+    # ── v13-D config 테이블 — 런타임 임계치 관리 ──────────
+    # dot notation key (예: 'keyword.pool_max_size'). value 는 항상 str.
+    # 미구현 백엔드(csv/xlsx/sheets) 는 in-memory dict 폴백.
+    def get_config(self, key: str) -> Optional[str]:
+        d = getattr(self, "_in_memory_config", None) or {}
+        v = d.get(key)
+        return str(v) if v is not None else None
+
+    def set_config(self, key: str, value: str) -> None:
+        if not hasattr(self, "_in_memory_config"):
+            self._in_memory_config = {}
+        self._in_memory_config[key] = str(value)
+
+    def delete_config(self, key: str) -> bool:
+        d = getattr(self, "_in_memory_config", None) or {}
+        if key in d:
+            del d[key]
+            return True
+        return False
+
+    def list_config(self) -> List[tuple]:
+        d = getattr(self, "_in_memory_config", None) or {}
+        return [(k, v) for k, v in d.items()]
+
+    # ── v13-F accounts 테이블 — Tistory 등 발행 플랫폼 계정 ──
+    def list_accounts(self) -> List[Account]:
+        d = getattr(self, "_in_memory_accounts", None) or {}
+        return list(d.values())
+
+    def get_account(self, account_id: str) -> Optional[Account]:
+        d = getattr(self, "_in_memory_accounts", None) or {}
+        return d.get(account_id)
+
+    def upsert_account(self, account: Account) -> None:
+        if not hasattr(self, "_in_memory_accounts"):
+            self._in_memory_accounts = {}
+        if not account.id:
+            account.id = f"acc{len(self._in_memory_accounts) + 1:04d}"
+        self._in_memory_accounts[account.id] = account
+
+    def get_active_account(self, *, platform: str = "tistory",
+                            blog_id: str = "") -> Optional[Account]:
+        for a in self.list_accounts():
+            if not a.is_active:
+                continue
+            if platform and a.platform != platform:
+                continue
+            if blog_id and a.blog_id != blog_id:
+                continue
+            return a
+        return None
 
     def find_pool_by_keyword(self, keyword: str) -> Optional[KeywordPoolItem]:
         kw = (keyword or "").strip().lower()

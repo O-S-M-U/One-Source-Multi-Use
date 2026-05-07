@@ -30,6 +30,7 @@ class SeedRunReport:
     transmuted: int = 0
     rejected: int = 0
     items: List[KeywordPoolItem] = field(default_factory=list)
+    housekeeping: Optional[object] = None   # v13-E HousekeepingReport
 
     def summary(self):
         return (f"seed='{self.seed}' expanded={self.expanded} "
@@ -48,8 +49,23 @@ class KeywordResearcher:
         self.cfg = cfg or Config()
         self.storage = storage or build_storage(self.cfg)
         self.evaluator = evaluator or build_evaluator(self.cfg)
+        # v13-D: ConfigManager — env > DB config > defaults
+        from ..config_manager import ConfigManager
+        self.config_mgr = ConfigManager(self.storage)
         log.info("KeywordResearcher ready (storage=%s evaluator=%s)",
                  self.storage.name, self.evaluator.name)
+
+    # ── v13-C/D: config-driven thresholds (legacy cfg 도 fallback) ──
+    @property
+    def golden_threshold(self) -> float:
+        """env > db config > 코드 기본값(60)."""
+        v = self.config_mgr.get_float("keyword.golden_threshold", 0.0)
+        return v if v > 0 else float(getattr(self.cfg, "golden_threshold", 60.0))
+
+    @property
+    def crumb_upper(self) -> float:
+        """v13: 부스러기/강철 경계 (default 45)."""
+        return self.config_mgr.get_float("keyword.pool_eviction_score_threshold", 45.0)
 
     def _next_keyword_id(self, extra=None):
         existing = self.storage.list_pool() + (extra or [])
@@ -75,8 +91,10 @@ class KeywordResearcher:
 
     # ── 핵심: 사전 필터 + 단계별 파이프라인 ────────────────
     def run_seed(self, seed: str, *, expand_limit: int = 10,
-                 pre_filter_top: int = 15) -> SeedRunReport:
+                 pre_filter_top: int = 15,
+                 housekeeping: bool = True) -> SeedRunReport:
         """[ 5단계 파이프라인 ]
+        0. (v13-E) housekeeping — revival 재평가 + 풀삭제 정책 (매 실행 시작)
         1. expand → 후보 (자동완성 + 접미어)
         2. quick_score_commercial 로 상위 pre_filter_top 개 사전 선별 (API 호출 0)
         3. 평가기 evaluate() — 비싼 API 호출
@@ -87,6 +105,18 @@ class KeywordResearcher:
         report = SeedRunReport(seed=seed)
         if not seed:
             return report
+
+        # ── Step 0 (v13-E): housekeeping 내재화 ──
+        if housekeeping:
+            try:
+                from .housekeeping import Housekeeping
+                hk = Housekeeping(self.storage, evaluator=self.evaluator,
+                                    config_mgr=self.config_mgr)
+                hk_report = hk.run()
+                log.info("▶ housekeeping: %s", hk_report.summary())
+                report.housekeeping = hk_report
+            except Exception as e:
+                log.warning("[run_seed] housekeeping 실패(무시): %s", e)
 
         # ── Step 1: 후보 확장 ──
         candidates = expander.expand(seed, limit=expand_limit)
@@ -173,7 +203,7 @@ class KeywordResearcher:
 
             rec = ResearchHistoryRecord(
                 keyword=keyword,
-                grade=grade_from_score(ev.score),
+                grade=grade_from_score(ev.score, golden_threshold=self.golden_threshold, crumb_upper=self.crumb_upper),
                 total_score=round(ev.score, 2),
                 profile=profile,
                 datalab_score=float(dl.get("trend_score", 0) or 0),
@@ -209,7 +239,7 @@ class KeywordResearcher:
             status=STATUS_GOLDEN,
             source=f"{self.evaluator.name}{source_suffix}",
             note=note,
-            grade=grade_from_score(ev.score),
+            grade=grade_from_score(ev.score, golden_threshold=self.golden_threshold, crumb_upper=self.crumb_upper),
             profile=profile,
             weak_points=", ".join(w.replace("_", "") for w in weak),
             is_alchemy="Y" if is_alchemy else "N",
@@ -266,7 +296,7 @@ class KeywordResearcher:
             status=status,
             source=f"{self.evaluator.name}/manual",
             note="user-checked",
-            grade=grade_from_score(ev.score),
+            grade=grade_from_score(ev.score, golden_threshold=self.golden_threshold, crumb_upper=self.crumb_upper),
             profile="일반",
             weak_points=", ".join(w.replace("_", "") for w in weak),
             is_alchemy="N",

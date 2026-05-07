@@ -102,7 +102,8 @@ class Generator:
                 UnsplashImageProvider(),
                 PicsumImageProvider(),
             ])
-        self._collector = Collector(self.crawler, min_sources=self.gencfg.n_sources)
+        self._collector = Collector(self.crawler, min_sources=self.gencfg.n_sources,
+                                      storage=self.storage)
 
     # ── 공개 API ─────────────────────────────────
     def generate(self, keyword: Union[str, KeywordContext], *, save: bool = True,

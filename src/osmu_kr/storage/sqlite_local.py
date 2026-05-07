@@ -17,7 +17,7 @@ import sqlite3
 from typing import List, Optional
 
 from ..models import (
-    ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
+    Account, ContentRecord, KeywordPoolItem, KeywordUsage, ResearchHistoryRecord,
     USAGE_IN_PROGRESS, normalize_status, now_utc, to_iso,
 )
 from .base import BaseStorage
@@ -429,6 +429,87 @@ class SqliteStorage(BaseStorage):
             (keyword_id,),
         )
         return [self._row_to_usage(r) for r in cur.fetchall()]
+
+    # ── v13-F accounts 테이블 ──────────────────────────
+    @staticmethod
+    def _row_to_account(row: sqlite3.Row) -> Account:
+        return Account(
+            id=row["id"],
+            platform=row["platform"] or "tistory",
+            blog_id=row["blog_id"] or "",
+            login_id=row["login_id"] or "",
+            cookie_path=row["cookie_path"] or "",
+            cookie_updated_at=row["cookie_updated_at"] or "",
+            is_active=int(row["is_active"] or 0),
+            note=row["note"] or "",
+            created_at=row["created_at"],
+        )
+
+    def list_accounts(self) -> List[Account]:
+        cur = self.conn.execute("SELECT * FROM accounts ORDER BY created_at")
+        return [self._row_to_account(r) for r in cur.fetchall()]
+
+    def get_account(self, account_id: str) -> Optional[Account]:
+        if not account_id:
+            return None
+        cur = self.conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,))
+        row = cur.fetchone()
+        return self._row_to_account(row) if row else None
+
+    def upsert_account(self, account: Account) -> None:
+        if not account.id:
+            cur = self.conn.execute("SELECT COUNT(*) FROM accounts")
+            n = cur.fetchone()[0] or 0
+            account.id = f"acc{n + 1:04d}"
+        if not account.created_at:
+            account.created_at = to_iso(now_utc())
+        with transaction(self.conn):
+            self.conn.execute(
+                """
+                INSERT INTO accounts
+                  (id, platform, blog_id, login_id, cookie_path,
+                   cookie_updated_at, is_active, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  platform=excluded.platform,
+                  blog_id=excluded.blog_id,
+                  login_id=excluded.login_id,
+                  cookie_path=excluded.cookie_path,
+                  cookie_updated_at=excluded.cookie_updated_at,
+                  is_active=excluded.is_active,
+                  note=excluded.note
+                """,
+                (account.id, account.platform, account.blog_id,
+                 account.login_id, account.cookie_path,
+                 account.cookie_updated_at, int(account.is_active),
+                 account.note, account.created_at),
+            )
+
+    # ── v13-D config 테이블 ────────────────────────────
+    def get_config(self, key: str) -> Optional[str]:
+        cur = self.conn.execute("SELECT value FROM config WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def set_config(self, key: str, value: str) -> None:
+        with transaction(self.conn):
+            self.conn.execute(
+                """
+                INSERT INTO config(key, value, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, str(value), to_iso(now_utc())),
+            )
+
+    def delete_config(self, key: str) -> bool:
+        with transaction(self.conn):
+            cur = self.conn.execute("DELETE FROM config WHERE key = ?", (key,))
+            return cur.rowcount > 0
+
+    def list_config(self) -> List[tuple]:
+        cur = self.conn.execute("SELECT key, value FROM config ORDER BY key")
+        return [(r["key"], r["value"]) for r in cur.fetchall()]
 
     def upsert_usage(self, usage: KeywordUsage) -> None:
         if not usage.id:

@@ -173,16 +173,17 @@ def test_mirror_storage_falls_back_to_local_when_no_credentials():
 
 
 def test_pool_item_grade_autofill():
+    """v13: 등급 부스러기/강철/황금. legacy alias(GRADE_GOOD/GRADE_MEDIUM/GRADE_FAIL) 도 호환."""
     from osmu_kr.models import KeywordPoolItem, grade_from_score
     item = KeywordPoolItem(keyword_id="0001", seed_keyword="t", keyword="kw", score=85.0)
     item.fill_grade()
     assert item.grade == "황금"
     item2 = KeywordPoolItem(keyword_id="0002", seed_keyword="t", keyword="kw2", score=50.0)
     item2.fill_grade()
-    assert item2.grade == "보통"
+    assert item2.grade == "강철"   # v13: 보통 → 강철
     assert grade_from_score(95) == "황금"
-    assert grade_from_score(70) == "좋은"
-    assert grade_from_score(20) == "미달"
+    assert grade_from_score(70) == "황금"  # v13: golden_threshold=60 default
+    assert grade_from_score(20) == "부스러기"  # v13: 미달 → 부스러기
 
 
 def test_research_history_round_trip():
@@ -2170,6 +2171,306 @@ def test_safety_layer_start_lock_raises_on_cooldown_violation():
     assert usage.id
 
 
+def test_v13f_accounts_round_trip_in_sqlite():
+    """v13-F: accounts 테이블 CRUD."""
+    import os, tempfile
+    from osmu_kr.models import Account
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_acct_"), "x.db")
+    s = SqliteStorage(db_path=db)
+
+    a = Account(
+        id="acc-001", platform="tistory", blog_id="myblog",
+        login_id="me@kakao.com",
+        cookie_path="./cookies/tistory_myblog.json",
+        is_active=1, note="primary",
+    )
+    s.upsert_account(a)
+    fetched = s.get_account("acc-001")
+    assert fetched is not None
+    assert fetched.platform == "tistory"
+    assert fetched.blog_id == "myblog"
+    assert fetched.is_active == 1
+
+    # 활성 계정 조회
+    active = s.get_active_account(platform="tistory", blog_id="myblog")
+    assert active is not None and active.id == "acc-001"
+
+    # 비활성화
+    a.is_active = 0
+    s.upsert_account(a)
+    assert s.get_active_account(platform="tistory", blog_id="myblog") is None
+    s.close()
+
+
+def test_v13e_housekeeping_pool_eviction_2tier():
+    """v13-E: pool_max_size 초과 시 1순위/2순위 풀 삭제 정책."""
+    import os
+    from osmu_kr.config_manager import dot_to_env
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KeywordPoolItem, ResearchHistoryRecord, to_iso, now_utc,
+    )
+    from osmu_kr.researcher.housekeeping import Housekeeping
+
+    rs = fresh_researcher()
+    # legacy env 제거 — config_mgr.set() 이 효력 발휘하도록
+    os.environ.pop("OSMU_POOL_MAX_SIZE", None)
+    os.environ.pop(dot_to_env("keyword.pool_max_size"), None)
+    rs.config_mgr._cache_clear()
+    # config 세팅: pool_max=3, eviction_eval_count=2, eviction_score_threshold=45
+    rs.config_mgr.set("keyword.pool_max_size", 3)
+    rs.config_mgr.set("keyword.pool_eviction_eval_count", 2)
+    rs.config_mgr.set("keyword.pool_eviction_score_threshold", 45)
+    rs.config_mgr.set("keyword.revival_days", 9999)  # revival 비활성
+
+    # 4개 키워드 — kw1 은 저품질 반복(1순위 대상), 나머지는 신규
+    base_dt = "2026-05-01T00:00:00+0000"
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="kw1", seed_keyword="x", keyword="저품질 반복",
+        score=30.0, status=KSTATUS_ACTIVE, last_evaluated_at=base_dt,
+    ))
+    # 평가 이력 2건 — 평균 30
+    rs.storage.append_history(ResearchHistoryRecord(
+        keyword="저품질 반복", grade="부스러기", total_score=30.0,
+    ))
+    rs.storage.append_history(ResearchHistoryRecord(
+        keyword="저품질 반복", grade="부스러기", total_score=30.0,
+    ))
+    for kid, kw, score in [
+        ("kw2", "신규 b", 70.0), ("kw3", "신규 c", 65.0), ("kw4", "신규 d", 75.0),
+    ]:
+        rs.storage.upsert_pool(KeywordPoolItem(
+            keyword_id=kid, seed_keyword="x", keyword=kw,
+            score=score, status=KSTATUS_ACTIVE,
+            last_evaluated_at=base_dt,
+        ))
+
+    hk = Housekeeping(rs.storage, evaluator=None, config_mgr=rs.config_mgr)
+    report = hk.run()
+
+    # 4개 → 3개로 줄어야 함. kw1 (저품질 반복) 이 1순위로 evict.
+    assert report.pool_size_after <= 3
+    assert report.evicted_primary == 1
+    pool_after = [it.keyword_id for it in rs.storage.list_pool()]
+    assert "kw1" not in pool_after
+
+
+def test_v13e_housekeeping_archive_low_score_on_revival():
+    """v13-E: revival 재평가에서 저품질 → archive."""
+    from osmu_kr.models import (
+        KSTATUS_ACTIVE, KSTATUS_ARCHIVED, KeywordPoolItem,
+        Evaluation, normalize_status,
+    )
+    from osmu_kr.evaluator.base import BaseEvaluator
+    from osmu_kr.researcher.housekeeping import Housekeeping
+
+    class LowScoreEval(BaseEvaluator):
+        name = "low_eval"
+        def evaluate(self, keyword, *, seed=""):
+            return Evaluation(score=30.0, raw={"e": "low"})
+
+    rs = fresh_researcher()
+    rs.config_mgr.set("keyword.revival_days", 0.001)   # 즉시 트리거
+    rs.config_mgr.set("keyword.pool_eviction_score_threshold", 45)
+    rs.config_mgr.set("keyword.pool_max_size", 100)    # eviction 안 일어나게
+
+    rs.storage.upsert_pool(KeywordPoolItem(
+        keyword_id="kw-old", seed_keyword="x", keyword="오래된 저품질",
+        score=80.0, status=KSTATUS_ACTIVE,
+        last_evaluated_at="2024-01-01T00:00:00+0000",
+    ))
+
+    hk = Housekeeping(rs.storage, evaluator=LowScoreEval(),
+                       config_mgr=rs.config_mgr)
+    report = hk.run()
+    assert report.re_evaluated >= 1
+    assert report.archived_low_quality >= 1
+    item = rs.storage.get_pool("kw-old")
+    assert normalize_status(item.status) == KSTATUS_ARCHIVED
+
+
+def test_v13g_phase1_self_cannibalization_warning():
+    """v13-G: Phase 1 종료 시 기존 글의 summary_embedding 과 cosine ≥ 0.75 면 경고."""
+    import json
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.collector import Collector
+    from osmu_kr.content_generator.embedder import StubEmbedder
+    from osmu_kr.content_generator.interfaces import BaseCrawler, CrawledPage
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+    from osmu_kr.models import ContentRecord
+
+    class StubCrawler(BaseCrawler):
+        name = "stub"
+        def search(self, q, *, limit=5): return []
+        def scrape(self, url): return CrawledPage(url=url, title="t", content="c")
+
+    rs = fresh_researcher()
+    embedder = StubEmbedder()
+    # phase1 이 만들 embedding_input 과 동일한 텍스트로 미리 인코딩 (cosine ≈ 1.0)
+    ctx = KeywordContext.from_keyword("적금 추천")
+    expected_bp = generate_blueprint(ctx, use_llm=False)
+    existing_emb = embedder.encode(expected_bp.embedding_input())
+
+    rs.storage.append_content(ContentRecord(
+        id="prev-001", keyword="적금 추천", title="적금 추천",
+        status="generated",
+        summary_embedding_json=json.dumps(existing_emb),
+    ))
+
+    c = Collector(StubCrawler(), embedder=embedder, storage=rs.storage)
+    bp = c.phase1(ctx)
+
+    # 경고가 raw_signals 에 기록돼야 함
+    assert "self_cannibalization_warnings" in bp.raw_signals
+    assert "prev-001" in bp.raw_signals["self_cannibalization_warnings"]
+
+
+def test_v13_grade_thresholds():
+    """v13-C: 부스러기(0~45) / 강철(46~59) / 황금(60+)."""
+    from osmu_kr.models import (
+        grade_from_score, GRADE_GOLDEN, GRADE_STEEL, GRADE_CRUMB,
+    )
+    # default 60/45
+    assert grade_from_score(80.0) == GRADE_GOLDEN
+    assert grade_from_score(60.0) == GRADE_GOLDEN
+    assert grade_from_score(59.9) == GRADE_STEEL
+    assert grade_from_score(50.0) == GRADE_STEEL
+    assert grade_from_score(45.0) == GRADE_CRUMB
+    assert grade_from_score(10.0) == GRADE_CRUMB
+    # config-driven thresholds — golden 70, crumb 50
+    assert grade_from_score(65, golden_threshold=70.0, crumb_upper=50.0) == GRADE_STEEL
+    assert grade_from_score(70, golden_threshold=70.0, crumb_upper=50.0) == GRADE_GOLDEN
+    assert grade_from_score(50, golden_threshold=70.0, crumb_upper=50.0) == GRADE_CRUMB
+
+
+def test_v13_researcher_uses_config_golden_threshold():
+    """v13-C: KeywordResearcher.golden_threshold 가 config_mgr 기반."""
+    import os
+    from osmu_kr.config_manager import dot_to_env
+
+    rs = fresh_researcher()
+    # 모든 매핑된 env 정리
+    saved_legacy = os.environ.pop("OSMU_GOLDEN_THRESHOLD", None)
+    new_name = dot_to_env("keyword.golden_threshold")
+    saved_new = os.environ.pop(new_name, None)
+    try:
+        rs.config_mgr._cache_clear()
+        # default — 코드 기본값(legacy cfg) 또는 config 60
+        gt0 = rs.golden_threshold
+        assert gt0 in (60.0, 65.0, 70.0)   # default 또는 cfg 기본값
+        # DB 에 저장 → 우선순위 작동
+        rs.config_mgr.set("keyword.golden_threshold", 65)
+        assert rs.golden_threshold == 65.0
+        # crumb_upper 도 config-driven
+        assert rs.crumb_upper == 45.0
+        rs.config_mgr.set("keyword.pool_eviction_score_threshold", 50)
+        assert rs.crumb_upper == 50.0
+    finally:
+        if saved_legacy is not None:
+            os.environ["OSMU_GOLDEN_THRESHOLD"] = saved_legacy
+        if saved_new is not None:
+            os.environ[new_name] = saved_new
+
+
+def test_config_table_round_trip_in_sqlite():
+    """v13-D: SQLite config 테이블 set/get/list/delete 라운드트립."""
+    import os, tempfile
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_cfg_"), "x.db")
+    s = SqliteStorage(db_path=db)
+    assert s.get_config("nope") is None
+    s.set_config("keyword.golden_threshold", "65")
+    assert s.get_config("keyword.golden_threshold") == "65"
+    s.set_config("keyword.golden_threshold", "70")  # upsert
+    assert s.get_config("keyword.golden_threshold") == "70"
+    rows = s.list_config()
+    assert ("keyword.golden_threshold", "70") in rows
+    assert s.delete_config("keyword.golden_threshold") is True
+    assert s.get_config("keyword.golden_threshold") is None
+    s.close()
+
+
+def test_config_manager_priority_env_over_db_over_default():
+    """v13-D: env > db > default 우선순위.
+
+    keyword.golden_threshold 로 검증 — fresh_researcher 가 건드리지 않는 키.
+    """
+    import os
+    from osmu_kr.config_manager import ConfigManager, dot_to_env
+
+    rs = fresh_researcher()
+    # fresh_researcher 가 세팅하는 legacy env 정리
+    saved_legacy = os.environ.pop("OSMU_GOLDEN_THRESHOLD", None)
+    new_name = dot_to_env("keyword.golden_threshold")
+    saved_new = os.environ.pop(new_name, None)
+    try:
+        cm = ConfigManager(rs.storage)
+        # default 만 있는 상태
+        assert cm.get_int("keyword.golden_threshold") == 60
+        assert cm.get_source("keyword.golden_threshold") == "default"
+
+        # DB 에 저장 → DB 가 default 보다 우선
+        cm.set("keyword.golden_threshold", 65)
+        assert cm.get_int("keyword.golden_threshold") == 65
+        assert cm.get_source("keyword.golden_threshold") == "db"
+
+        # env (dot notation) 가 DB 보다 우선
+        os.environ[new_name] = "70"
+        cm._cache_clear()
+        assert cm.get_int("keyword.golden_threshold") == 70
+        assert cm.get_source("keyword.golden_threshold") == "env"
+    finally:
+        if saved_legacy is not None:
+            os.environ["OSMU_GOLDEN_THRESHOLD"] = saved_legacy
+        if saved_new is None:
+            os.environ.pop(new_name, None)
+        else:
+            os.environ[new_name] = saved_new
+
+
+def test_config_manager_legacy_env_fallback():
+    """기존 OSMU_GOLDEN_THRESHOLD 같은 legacy 환경변수도 매핑."""
+    import os
+    from osmu_kr.config_manager import ConfigManager, dot_to_env
+
+    rs = fresh_researcher()
+    cm = ConfigManager(rs.storage)
+    # dot notation env 는 비우고 legacy 만
+    new_name = dot_to_env("keyword.golden_threshold")
+    saved_new = os.environ.pop(new_name, None)
+    saved_legacy = os.environ.get("OSMU_GOLDEN_THRESHOLD")
+    os.environ["OSMU_GOLDEN_THRESHOLD"] = "75"
+    try:
+        cm._cache_clear()
+        assert cm.get_int("keyword.golden_threshold") == 75
+        assert "legacy" in cm.get_source("keyword.golden_threshold")
+    finally:
+        if saved_new is not None:
+            os.environ[new_name] = saved_new
+        if saved_legacy is None:
+            os.environ.pop("OSMU_GOLDEN_THRESHOLD", None)
+        else:
+            os.environ["OSMU_GOLDEN_THRESHOLD"] = saved_legacy
+
+
+def test_config_manager_install_defaults():
+    """v13-D: DEFAULTS 19개 항목을 DB 에 부트스트랩."""
+    from osmu_kr.config_manager import ConfigManager, DEFAULTS
+
+    rs = fresh_researcher()
+    cm = ConfigManager(rs.storage)
+    n = cm.install_defaults()
+    assert n == len(DEFAULTS) == 19
+    # 두 번째 호출은 이미 있으니 0
+    n2 = cm.install_defaults()
+    assert n2 == 0
+    # overwrite=True 면 다시 19개
+    n3 = cm.install_defaults(overwrite=True)
+    assert n3 == 19
+
+
 def test_keyword_usages_round_trip_in_sqlite():
     """v13 keyword_usages SQLite CRUD."""
     import os, tempfile
@@ -2374,6 +2675,16 @@ TESTS = [
     test_safety_layer_v13_failed_unlocks_and_keeps_published_at_empty,
     test_safety_layer_v13_archive_cancels_active_lock,
     test_recommend_v13_excludes_active_lock_and_published_in_blog,
+    test_v13_grade_thresholds,
+    test_v13_researcher_uses_config_golden_threshold,
+    test_v13f_accounts_round_trip_in_sqlite,
+    test_v13e_housekeeping_pool_eviction_2tier,
+    test_v13e_housekeeping_archive_low_score_on_revival,
+    test_v13g_phase1_self_cannibalization_warning,
+    test_config_table_round_trip_in_sqlite,
+    test_config_manager_priority_env_over_db_over_default,
+    test_config_manager_legacy_env_fallback,
+    test_config_manager_install_defaults,
     test_keyword_usages_round_trip_in_sqlite,
     # ── [v13-B] keyword embedding + 씨드 중복 + 어뷰징 쿨다운 ──
     test_keyword_embedding_round_trip_in_sqlite,

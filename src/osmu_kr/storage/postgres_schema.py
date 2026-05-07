@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS keyword_usages (
 DDL_ACCOUNTS = """
 CREATE TABLE IF NOT EXISTS accounts (
     id                TEXT     PRIMARY KEY,
+    platform          TEXT     NOT NULL DEFAULT 'tistory',
     blog_id           TEXT     NOT NULL,
     login_id          TEXT     NOT NULL DEFAULT '',
     cookie_path       TEXT     NOT NULL DEFAULT '',
@@ -131,6 +132,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     is_active         INTEGER  NOT NULL DEFAULT 1,
     note              TEXT     NOT NULL DEFAULT '',
     created_at        TEXT     NOT NULL
+);
+"""
+
+DDL_CONFIG = """
+CREATE TABLE IF NOT EXISTS config (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -218,6 +227,7 @@ def initialize_schema(conn: "psycopg.Connection") -> bool:
 
         for ddl in (DDL_KEYWORDS, DDL_KEYWORD_EVALUATIONS,
                     DDL_KEYWORD_USAGES, DDL_ACCOUNTS,
+                    DDL_CONFIG,
                     ddl_contents(use_vector)):
             cur.execute(ddl)
         # keywords.embedding 컬럼 — pgvector 면 vector(768), 아니면 text
