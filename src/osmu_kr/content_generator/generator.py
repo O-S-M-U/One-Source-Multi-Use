@@ -187,20 +187,32 @@ class Generator:
             image_error = (image_error + " | no_images_used").strip(" |")
             log.warning("[generator] 이미지 0개 — 텍스트만으로 진행")
 
-        # ── Step 3: Writer (raw + 이미지 함께 전달) ──
+        # ── Step 3: Writer ──
+        # v13 spec: blueprint + facts(normalized_sources) 가 있으면 그쪽 우선,
+        #           없으면 raw_content 폴백.
         write_error = ""
         writer_used = self.writer.name
         try:
-            html = self.writer.write(
-                kw, raw.text[: self.gencfg.pool_max_chars],
-                sources=raw.sources, images=images,
-            )
+            if blueprint is not None:
+                html = self.writer.write_from_blueprint(
+                    blueprint, phase2_result, images=images,
+                )
+            else:
+                html = self.writer.write(
+                    kw, raw.text[: self.gencfg.pool_max_chars],
+                    sources=raw.sources, images=images,
+                )
         except Exception as e:
             write_error = str(e)
             log.warning("[generator] 1차 writer 실패: %s", e)
             if self.gencfg.fallback_to_heuristic:
                 fallback = HeuristicWriter()
-                html = fallback.write(kw, raw.text, sources=raw.sources, images=images)
+                if blueprint is not None:
+                    html = fallback.write_from_blueprint(
+                        blueprint, phase2_result, images=images,
+                    )
+                else:
+                    html = fallback.write(kw, raw.text, sources=raw.sources, images=images)
                 writer_used = f"{self.writer.name}→heuristic_fallback"
                 write_error += " | fallback_used"
             else:

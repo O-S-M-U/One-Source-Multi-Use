@@ -110,7 +110,22 @@ class BaseCrawler(ABC):
 
 
 class BaseWriter(ABC):
-    """raw_content → SEO HTML 생성."""
+    """글 본문 HTML 생성기.
+
+    [ 두 진입점 ]
+      1) write_from_blueprint(blueprint, normalized_sources, images)  ★ v13 권장
+         - collector Phase 1 청사진 + Phase 2 정규화 facts 를 받아 ‘충실히 HTML 변환’.
+         - fact_based 단락 → facts 만 컨텍스트로 (raw 소스 비노출 — 표절 방어).
+         - llm_generated 단락 → keyword + core_message + 글 맥락만으로 자유 생성.
+
+      2) write(keyword, raw_content, sources, images)                 (legacy 호환)
+         - 기존 raw_content 직접 입력 — collector phase 가 비활성·실패한 경우의 폴백.
+
+    [ 기본 동작 ]
+      구현체는 write() 한 가지만 의무로 구현. write_from_blueprint() 의 default
+      구현은 blueprint + facts 를 raw_content 텍스트로 직렬화해 write() 에 위임 —
+      기존 Writer 가 즉시 동작.
+    """
 
     name: str = "base_writer"
 
@@ -125,6 +140,74 @@ class BaseWriter(ABC):
         tone: str = "전문적",
     ) -> str:
         """HTML 콘텐츠를 반환. 실패 시 RuntimeError."""
+
+    def write_from_blueprint(
+        self,
+        blueprint,                       # BlueprintResult — circular import 회피
+        normalized_sources=None,         # Optional[Phase2Result] (또는 dict)
+        *,
+        images: Optional[List[ImageItem]] = None,
+        tone: str = "전문적",
+    ) -> str:
+        """v13 진입점 — 청사진 + facts 기반.
+
+        Default 구현: blueprint + facts 를 텍스트로 직렬화해 write() 호출.
+        v13 spec 그대로 받고 싶은 구현체는 이 메서드를 override.
+        """
+        sources_list: List[str] = []
+        # 1) phase2 의 source_url 들을 sources 로 모음
+        try:
+            if normalized_sources is not None:
+                if hasattr(normalized_sources, "sources_by_section"):
+                    for facts in normalized_sources.sources_by_section.values():
+                        for f in facts:
+                            url = getattr(f, "source_url", "")
+                            if url and url not in sources_list:
+                                sources_list.append(url)
+                elif isinstance(normalized_sources, dict):
+                    for facts in normalized_sources.values():
+                        for f in facts:
+                            url = (f.get("source_url") if isinstance(f, dict) else "") or ""
+                            if url and url not in sources_list:
+                                sources_list.append(url)
+        except Exception:
+            pass
+
+        # 2) blueprint + facts 를 raw_content 직렬화 (legacy write() 입력)
+        lines = [f"# {blueprint.title}", "",
+                  f"[도입] {blueprint.intro}",
+                  f"[결론] {blueprint.short_conclusion}", ""]
+        for p in blueprint.paragraphs:
+            lines.append(f"## {p.title}  ({p.paragraph_type})")
+            if p.description:
+                lines.append(f"  - 핵심: {p.description}")
+            # fact_based 단락은 facts 도 같이 (있을 때만)
+            if p.paragraph_type == "fact_based" and normalized_sources is not None:
+                facts = []
+                if hasattr(normalized_sources, "sources_by_section"):
+                    facts = normalized_sources.sources_by_section.get(p.section_index, [])
+                elif isinstance(normalized_sources, dict):
+                    facts = normalized_sources.get(p.section_index, []) or \
+                             normalized_sources.get(str(p.section_index), [])
+                for f in facts[:5]:
+                    txt = getattr(f, "fact_text", None) or (f.get("fact_text", "") if isinstance(f, dict) else "")
+                    if txt:
+                        lines.append(f"  · {txt}")
+            lines.append("")
+        # commercial 도 단락 끝에 안내
+        ce = blueprint.commercial_elements
+        if ce.recommendations:
+            lines.append("[추천 항목] " + " / ".join(ce.recommendations[:5]))
+        if ce.cta_candidates:
+            lines.append("[CTA 후보] " + " / ".join(ce.cta_candidates[:3]))
+
+        return self.write(
+            blueprint.keyword,
+            "\n".join(lines),
+            sources=sources_list,
+            images=images,
+            tone=tone,
+        )
 
 
 class BaseImageProvider(ABC):

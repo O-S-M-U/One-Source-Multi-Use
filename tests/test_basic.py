@@ -2171,6 +2171,83 @@ def test_safety_layer_start_lock_raises_on_cooldown_violation():
     assert usage.id
 
 
+def test_cm_base_writer_default_write_from_blueprint_delegates_to_write():
+    """cm-A: BaseWriter.write_from_blueprint default 구현이 write() 에 위임."""
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.interfaces import BaseWriter
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    captured = {}
+
+    class W(BaseWriter):
+        name = "w"
+        def write(self, keyword, raw_content, *, sources=None, images=None, tone="전문적"):
+            captured["keyword"] = keyword
+            captured["raw_len"] = len(raw_content)
+            captured["sources"] = list(sources or [])
+            captured["tone"] = tone
+            return f"<h1>{keyword}</h1><h2>x</h2><p>ok</p>"
+
+    bp = generate_blueprint(KeywordContext.from_keyword("적금 추천"), use_llm=False)
+    w = W()
+    html = w.write_from_blueprint(bp, normalized_sources=None, images=None)
+    assert html.startswith("<h1>")
+    assert captured["keyword"] == "적금 추천"
+    # 청사진이 텍스트로 직렬화돼서 raw_content 로 들어가야 함
+    assert captured["raw_len"] > 0
+
+
+def test_cm_generator_uses_blueprint_writer_path():
+    """cm-C: Generator 가 write_from_blueprint() 를 우선 호출."""
+    import os
+    from osmu_kr.content_generator import Generator
+    from osmu_kr.content_generator.generator import GeneratorConfig
+    from osmu_kr.content_generator.interfaces import (
+        BaseCrawler, BaseImageProvider, BaseWriter, CrawledPage, ImageItem,
+    )
+
+    captured = {"used": ""}
+
+    class C(BaseCrawler):
+        name = "c"
+        def search(self, q, *, limit=5): return [f"https://x/{i}" for i in range(limit)]
+        def scrape(self, url):
+            return CrawledPage(url=url, title="t",
+                                content=("적금 추천 글입니다. 금리 비교가 핵심. "
+                                          "우대조건도 살펴봐야 합니다. " * 4))
+    class W(BaseWriter):
+        name = "w"
+        def write(self, keyword, raw_content, *, sources=None, images=None, tone="전문적"):
+            captured["used"] = "write"
+            return f"<h1>{keyword}</h1><h2>x</h2><p>ok</p>"
+        def write_from_blueprint(self, blueprint, normalized_sources=None, *, images=None, tone="전문적"):
+            captured["used"] = "write_from_blueprint"
+            captured["title"] = blueprint.title
+            return f"<h1>{blueprint.title}</h1><h2>x</h2><p>ok</p>"
+    class I(BaseImageProvider):
+        name = "i"
+        def search(self, q, *, count=3, slug="", alt_keyword=""):
+            return [ImageItem(url=f"https://i/{i}.jpg", filename=f"x-{i}.jpg",
+                                alt="a", source="s") for i in range(1, count + 1)]
+
+    saved = os.environ.get("OSMU_EMBEDDER")
+    os.environ["OSMU_EMBEDDER"] = "stub"
+    try:
+        g = Generator(crawler=C(), writer=W(), images=I(),
+                      config=GeneratorConfig(min_h2_sections=1, min_paragraphs=1,
+                                              min_images=0))
+        result = g.generate("적금 추천", save=False)
+    finally:
+        if saved is None:
+            os.environ.pop("OSMU_EMBEDDER", None)
+        else:
+            os.environ["OSMU_EMBEDDER"] = saved
+
+    assert captured["used"] == "write_from_blueprint"
+    assert "적금 추천" in captured["title"]
+    assert result.refined_post.startswith("<h1>")
+
+
 def test_v13f_accounts_round_trip_in_sqlite():
     """v13-F: accounts 테이블 CRUD."""
     import os, tempfile
@@ -2677,6 +2754,8 @@ TESTS = [
     test_recommend_v13_excludes_active_lock_and_published_in_blog,
     test_v13_grade_thresholds,
     test_v13_researcher_uses_config_golden_threshold,
+    test_cm_base_writer_default_write_from_blueprint_delegates_to_write,
+    test_cm_generator_uses_blueprint_writer_path,
     test_v13f_accounts_round_trip_in_sqlite,
     test_v13e_housekeeping_pool_eviction_2tier,
     test_v13e_housekeeping_archive_low_score_on_revival,

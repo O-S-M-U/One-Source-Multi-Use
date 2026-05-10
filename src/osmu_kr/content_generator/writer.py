@@ -348,6 +348,106 @@ class AnthropicWriter(BaseWriter):
 
         raise RuntimeError(f"Anthropic 호출 최종 실패: {last_err}")
 
+    # ── v13 진입점 — 청사진 + facts 기반 ────────────────
+    def write_from_blueprint(self, blueprint, normalized_sources=None, *,
+                              images=None, tone="전문적"):
+        """v13 spec 3.5: collector 청사진을 ‘충실히 HTML 변환’.
+
+        - fact_based 단락은 facts 만 컨텍스트로 (raw 소스 비노출).
+        - llm_generated 단락은 keyword + core_message + 글 맥락만으로 자유 생성.
+        - commercial_elements 는 본문에 자연스럽게 녹이도록 안내.
+        """
+        if not self.has_credentials:
+            raise RuntimeError("ANTHROPIC_API_KEY 가 설정돼 있지 않습니다.")
+
+        norm_images: List[ImageItem] = []
+        for img in (images or []):
+            if isinstance(img, ImageItem):
+                norm_images.append(img)
+            elif isinstance(img, str):
+                norm_images.append(ImageItem(url=img, filename="", alt=blueprint.keyword))
+
+        # 단락 타입별 컨텍스트 구성
+        para_blocks: List[str] = []
+        for p in blueprint.paragraphs:
+            head = (
+                f"### 단락 {p.section_index} — {p.title}\n"
+                f"  · type: {p.paragraph_type}\n"
+                f"  · core_message: {p.description or '(없음)'}\n"
+            )
+            if p.paragraph_type == "fact_based" and normalized_sources is not None:
+                facts = []
+                if hasattr(normalized_sources, "sources_by_section"):
+                    facts = normalized_sources.sources_by_section.get(p.section_index, [])
+                elif isinstance(normalized_sources, dict):
+                    facts = (normalized_sources.get(p.section_index, []) or
+                              normalized_sources.get(str(p.section_index), []))
+                if facts:
+                    head += "  · facts (이 단락에서만 인용):\n"
+                    for f in facts[:6]:
+                        txt = (getattr(f, "fact_text", None)
+                                or (f.get("fact_text", "") if isinstance(f, dict) else ""))
+                        if txt:
+                            head += f"      - {txt}\n"
+                else:
+                    head += "  · facts: (없음 — 일반 상식으로 보강)\n"
+            else:
+                head += "  · facts: (해당 없음 — 자유 생성 단락)\n"
+            para_blocks.append(head)
+
+        ce = blueprint.commercial_elements
+        commercial_brief = (
+            f"  · 추천: {', '.join(ce.recommendations[:5]) or '(없음)'}\n"
+            f"  · 비교축: {', '.join(ce.comparison_points[:5]) or '(없음)'}\n"
+            f"  · CTA 후보: {', '.join(ce.cta_candidates[:5]) or '(없음)'}\n"
+        )
+        image_brief = _format_image_brief(norm_images)
+
+        profile = profile_for(blueprint.keyword)
+        system_prompt = _build_system_prompt(profile, blueprint.keyword)
+        log.info("[writer.anthropic.v13] keyword='%s' domain=%s sections=%d",
+                  blueprint.keyword, profile.domain.value, len(blueprint.paragraphs))
+
+        user_prompt = (
+            f"타겟 키워드: {blueprint.keyword}\n"
+            f"도메인: {profile.name_ko}\n"
+            f"글 톤: {tone}\n"
+            f"타겟 독자: {blueprint.target_reader.persona} "
+            f"(레벨={blueprint.target_reader.knowledge_level}, "
+            f"의도={blueprint.target_reader.primary_intent})\n\n"
+            f"━━ [ 글 메타 — 그대로 사용할 것 ] ━━\n"
+            f"제목(h1): {blueprint.title}\n"
+            f"도입문: {blueprint.intro}\n"
+            f"짧은 결론: {blueprint.short_conclusion}\n\n"
+            f"━━ [ 단락 청사진 — 순서·제목·타입 그대로 따를 것 ] ━━\n"
+            + "\n".join(para_blocks) + "\n"
+            f"━━ [ 수익 포인트 (commercial) — 본문에 자연스럽게 녹일 것 ] ━━\n"
+            + commercial_brief + "\n"
+            f"━━ [ 이미지 — role 매핑대로 정확한 섹션에 ] ━━\n{image_brief}\n\n"
+            f"[ 작성 지침 ]\n"
+            f"- fact_based 단락은 위에 제공된 facts 만 인용. 추가 ‘없는 사실’ 만들지 말 것.\n"
+            f"- llm_generated 단락은 keyword + core_message + 전체 글 맥락만으로 자연 생성.\n"
+            f"- 단락 순서/제목은 청사진 그대로. 5~7개 h2 유지.\n"
+            f"- 추천/비교/CTA 는 본문 중·후반에 자연스럽게 박을 것 (광고 티 안 나게).\n"
+            f"- 절대 금지 표현 사용 금지. 가짜 통계·출처 미상 인용 금지."
+        )
+
+        last_err: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                html = self._call_anthropic(system_prompt, user_prompt)
+                if not html or "<h1" not in html.lower():
+                    raise RuntimeError("응답 형식 위반 — <h1> 누락")
+                html = re.sub(r"^```(?:html)?\s*|\s*```$", "", html.strip(),
+                                flags=re.IGNORECASE)
+                html = repair_missing_images(html, norm_images)
+                return html
+            except Exception as e:
+                last_err = e
+                log.warning("[writer.anthropic.v13] %d차 실패: %s", attempt, e)
+                time.sleep(1.5)
+        raise RuntimeError(f"Anthropic 호출 최종 실패: {last_err}")
+
 
 # ── Heuristic Writer (폴백) — 도메인 적응형 ─────────
 # Generator 가 보내는 ‘fallback 시드’ 를 본문에 그대로 노출하지 않기 위한 마커.
