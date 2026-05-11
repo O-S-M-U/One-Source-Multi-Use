@@ -2354,6 +2354,42 @@ def test_checker_keywords_present_check_with_blueprint():
     assert "적금 추천" in res.keywords_present
 
 
+def test_slack_stub_when_no_credentials():
+    """next-6: Slack 키 없으면 stub — sent=False + no_credentials."""
+    import os
+    from osmu_kr.notifications import post_slack_message
+    os.environ.pop("SLACK_BOT_TOKEN", None)
+    os.environ.pop("SLACK_CHANNEL_ID", None)
+    res = post_slack_message("hello")
+    assert res.sent is False
+    assert res.error == "no_credentials"
+
+
+def test_submit_for_review_skips_when_check_failed():
+    """checker 실패면 Stage 2 진입 안 함."""
+    from osmu_kr.checker import CheckerResult
+    from osmu_kr.notifications import submit_for_review
+    bad = CheckerResult(passed=False, issues=["char_count_too_low"])
+    res = submit_for_review(content_id="c-1", title="t", check_result=bad)
+    assert res.sent is False
+    assert "check_failed" in res.error
+
+
+def test_checker_cse_skipped_without_credentials():
+    """next-5: CSE 키 없으면 cse_skipped_reason 기록."""
+    import os
+    from osmu_kr.checker import Checker
+    os.environ.pop("OSMU_GOOGLE_CSE_KEY", None)
+    os.environ.pop("OSMU_GOOGLE_CSE_CX", None)
+    html = (
+        "<h1>x</h1>" + "<p>본문 문장 하나는 충분히 길어야 합니다.</p>" * 20
+        + "<h2>1</h2><p>본문.</p>" * 3
+    )
+    res = Checker().run(html)
+    assert res.cse_skipped_reason == "no_credentials"
+    assert res.cse_total_hits == 0
+
+
 def test_checker_plagiarism_high_when_article_quotes_facts():
     """next-3: article 문장이 source 와 거의 같으면 plagiarism_max_sentence 높음."""
     import os
@@ -3035,6 +3071,9 @@ TESTS = [
     test_checker_flags_short_html_and_missing_alt,
     test_checker_keywords_present_check_with_blueprint,
     test_checker_plagiarism_high_when_article_quotes_facts,
+    test_checker_cse_skipped_without_credentials,
+    test_slack_stub_when_no_credentials,
+    test_submit_for_review_skips_when_check_failed,
     test_cli_config_set_and_get,
     test_cli_account_add_and_list,
     test_cli_housekeeping_runs_without_error,

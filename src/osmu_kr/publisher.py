@@ -78,8 +78,31 @@ class MockPublisher(BasePublisher):
 
 
 class TistoryPlaywrightPublisher(BasePublisher):
-    """Tistory 자동 발행 — Playwright 우회 (실 환경에서만)."""
+    """Tistory 자동 발행 — Playwright 우회 (실 환경에서만).
+
+    [ 보안 가드 ]
+      · OSMU_PUBLISH_REAL=1 환경변수 필수 (의도치 않은 실 발행 방지)
+      · account.cookie_path 의 쿠키 파일 필수
+
+    [ 발행 흐름 (v1 단순) ]
+      1) 쿠키 로드 + browser context 생성
+      2) https://{blog_id}.tistory.com/manage/newpost 접속
+      3) 제목 / 본문 (raw HTML) 입력
+      4) ‘발행’ 클릭 → 결과 URL 추출
+      5) 실패 시 쿠키 만료 의심 → notify_cookie_expired
+
+    [ 운영 노트 ]
+      · Tistory 가 자주 DOM 셀렉터를 바꾸므로, 실제 운영 시 셀렉터는
+        config 또는 별도 모듈로 분리해 빠르게 수정 가능하게 두는 게 좋다.
+      · headed 모드 권장 (headless 는 봇 탐지 트리거).
+    """
     name = "tistory_playwright"
+
+    def __init__(self, *, headless: bool = False, slow_mo: int = 100,
+                 timeout: int = 30_000):
+        self.headless = headless
+        self.slow_mo = slow_mo
+        self.timeout = timeout
 
     def publish(self, *, title, html, account, contents_id=""):
         if os.environ.get("OSMU_PUBLISH_REAL", "").strip() not in {"1", "true", "yes"}:
@@ -95,16 +118,115 @@ class TistoryPlaywrightPublisher(BasePublisher):
                 error=f"cookie 파일 없음: {account.cookie_path} — 재로그인 필요",
             )
         try:
-            from playwright.sync_api import sync_playwright  # noqa: F401
+            from playwright.sync_api import sync_playwright
         except ImportError:
             return PublishResult(
-                success=False, error="playwright 미설치 — pip install playwright"
+                success=False, error="playwright 미설치 — pip install playwright && playwright install chromium",
             )
-        # 실제 Playwright 자동화는 본 메서드를 override 또는 내부 구현 추가.
-        # v1 시작점은 인터페이스만 — 구체 구현은 운영 페이즈에서 채움.
+
+        import json
+        try:
+            with open(account.cookie_path, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+        except Exception as e:
+            return PublishResult(
+                success=False, error=f"cookie 파싱 실패: {e}",
+            )
+
+        url = ""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=self.headless, slow_mo=self.slow_mo,
+                )
+                try:
+                    context = browser.new_context()
+                    context.add_cookies(cookies)
+                    page = context.new_page()
+                    page.set_default_timeout(self.timeout)
+
+                    blog_id = account.blog_id or "myblog"
+                    write_url = f"https://{blog_id}.tistory.com/manage/newpost"
+                    page.goto(write_url)
+
+                    # 로그인 페이지로 리다이렉트되면 쿠키 만료
+                    if "auth.kakao.com" in page.url or "login" in page.url.lower():
+                        try:
+                            from .notifications import notify_cookie_expired
+                            notify_cookie_expired(
+                                blog_id=account.blog_id,
+                                login_id=account.login_id,
+                                account_id=account.id,
+                            )
+                        except Exception:
+                            pass
+                        return PublishResult(
+                            success=False,
+                            error=f"쿠키 만료 의심 — 재로그인 필요 (redirected to {page.url})",
+                        )
+
+                    # 제목 입력 — placeholder 또는 #title 류 셀렉터 시도
+                    title_selectors = ['#title', 'input[name="title"]',
+                                        'input[placeholder*="제목"]']
+                    for sel in title_selectors:
+                        try:
+                            page.fill(sel, title)
+                            break
+                        except Exception:
+                            continue
+
+                    # 본문 (HTML 모드) — 에디터 토글이 필요할 수 있음. v1 단순 시도.
+                    body_selectors = ['textarea#content', 'textarea[name="content"]',
+                                       '.tox-edit-area iframe']
+                    body_inserted = False
+                    for sel in body_selectors:
+                        try:
+                            page.fill(sel, html)
+                            body_inserted = True
+                            break
+                        except Exception:
+                            continue
+                    if not body_inserted:
+                        # fallback — JS 로 html 직접 주입
+                        page.evaluate(
+                            "(html) => { const ta=document.querySelector('textarea'); "
+                            "if (ta) ta.value=html; }",
+                            html,
+                        )
+
+                    # 발행 버튼 — 셀렉터는 운영 시 검증
+                    publish_selectors = [
+                        'button#publish', 'button.btn-publish',
+                        'button:has-text("공개 발행")', 'button:has-text("발행")',
+                    ]
+                    clicked = False
+                    for sel in publish_selectors:
+                        try:
+                            page.click(sel, timeout=5000)
+                            clicked = True
+                            break
+                        except Exception:
+                            continue
+                    if not clicked:
+                        return PublishResult(
+                            success=False,
+                            error="발행 버튼 클릭 실패 — DOM 셀렉터 확인 필요",
+                        )
+
+                    # 발행 완료 후 URL 추출 (예: /entry/{slug})
+                    page.wait_for_url("**/entry/**", timeout=15_000)
+                    url = page.url
+                finally:
+                    browser.close()
+        except Exception as e:
+            return PublishResult(success=False,
+                                   error=f"playwright 흐름 실패: {type(e).__name__}: {e}")
+
+        if not url:
+            return PublishResult(success=False, error="발행 URL 추출 실패")
         return PublishResult(
-            success=False,
-            error="Tistory Playwright 발행 흐름은 운영 단계에서 구현 — 현재는 인터페이스만 제공.",
+            success=True, platform_url=url,
+            published_at=to_iso(now_utc()),
         )
 
 

@@ -51,6 +51,10 @@ class CheckerResult:
     keywords_present: List[str] = field(default_factory=list)
     keywords_missing: List[str] = field(default_factory=list)
     link_check: Dict[str, str] = field(default_factory=dict)  # url → 'ok'/'fail:상태'
+    # next-5: Google CSE 광역 표절 — 글 일부 발췌 → CSE 검색 결과 카운트
+    cse_total_hits: int = 0              # CSE 가 매치 보고한 결과 수
+    cse_examples: List[str] = field(default_factory=list)   # 매치 URL 샘플 3개
+    cse_skipped_reason: str = ""         # 키 없음 등으로 skip 시 사유
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -239,6 +243,55 @@ class Checker:
         except Exception as e:
             log.warning("[checker] plagiarism check 실패(무시): %s", e)
 
+    # ── next-5: Google CSE 광역 표절 ─────────────────────
+    def _check_google_cse(self, html: str, result: CheckerResult) -> None:
+        """글 일부 발췌 → Google CSE 검색 → 매치 결과 카운트.
+
+        - OSMU_GOOGLE_CSE_KEY + OSMU_GOOGLE_CSE_CX 둘 다 있어야 동작.
+        - 글 본문에서 가장 ‘긴’ 문장 1개를 quote 검색.
+        - 결과 한도: 무료 100건/일 — 호출은 1회만.
+        """
+        import os
+        key = os.environ.get("OSMU_GOOGLE_CSE_KEY", "")
+        cx = os.environ.get("OSMU_GOOGLE_CSE_CX", "")
+        if not (key and cx):
+            result.cse_skipped_reason = "no_credentials"
+            return
+        sentences = _split_sentences(_strip_html(html))
+        if not sentences:
+            result.cse_skipped_reason = "no_sentences"
+            return
+        # 가장 긴 문장 1개 (10~80자 범위)
+        query_sent = max(sentences, key=len)
+        query_sent = query_sent[:80]
+        if len(query_sent) < 20:
+            result.cse_skipped_reason = "sentence_too_short"
+            return
+
+        try:
+            import requests
+        except ImportError:
+            result.cse_skipped_reason = "requests_missing"
+            return
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": key, "cx": cx, "q": f'"{query_sent}"', "num": 5},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                result.cse_skipped_reason = f"http_{r.status_code}"
+                return
+            data = r.json()
+            items = data.get("items", []) or []
+            total = int(data.get("searchInformation", {}).get("totalResults", 0))
+            result.cse_total_hits = total
+            result.cse_examples = [it.get("link", "") for it in items[:3]]
+            if total > 0:
+                result.warnings.append(f"cse_external_match:{total}")
+        except Exception as e:
+            result.cse_skipped_reason = f"call_failed:{type(e).__name__}"
+
     # ── 공개 API ──────────────────────────────────────
     def run(self, html: str, *,
              blueprint=None, normalized_sources=None,
@@ -266,12 +319,14 @@ class Checker:
         if blueprint is not None:
             self._check_keywords_present(html, blueprint, result)
         self._check_links(html, result, verify_external=verify_external_links)
-        # Tier B
+        # Tier B - 내부 표절 (정규화 소스)
         self._check_plagiarism(
             html, normalized_sources, result,
             overall_threshold=plag_overall,
             sentence_threshold=plag_sent,
         )
+        # Tier B - 외부 광역 표절 (Google CSE, 옵션)
+        self._check_google_cse(html, result)
 
         result.passed = not result.issues
         log.info("[checker] %s", result.summary())
