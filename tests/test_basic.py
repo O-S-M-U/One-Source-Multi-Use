@@ -2171,6 +2171,279 @@ def test_safety_layer_start_lock_raises_on_cooldown_violation():
     assert usage.id
 
 
+def _cli_use_sqlite_backend():
+    """CLI 테스트용 — SQLite 백엔드로 강제해 인스턴스 간 영속화 확보."""
+    import os, tempfile
+    tmp = tempfile.mkdtemp(prefix="osmu_cli_")
+    os.environ["OSMU_STORAGE_BACKEND"] = "sqlite"
+    os.environ["OSMU_SQLITE_PATH"] = os.path.join(tmp, "cli.db")
+    return tmp
+
+
+def _publish_setup_sqlite():
+    """publisher 테스트용 — SQLite 백엔드 + 계정 + 콘텐츠 준비."""
+    import os, tempfile
+    from osmu_kr.models import Account, ContentRecord
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+
+    db = os.path.join(tempfile.mkdtemp(prefix="osmu_pub_"), "x.db")
+    s = SqliteStorage(db_path=db)
+    s.upsert_account(Account(id="acc-1", platform="tistory",
+                              blog_id="myblog", login_id="me@k.com",
+                              cookie_path="/tmp/none", is_active=1))
+    return s
+
+
+def test_publisher_mock_publishes_successfully():
+    """next-4: MockPublisher 로 게이트 통과 → 발행 완료 갱신."""
+    from datetime import timedelta
+    from osmu_kr.models import (
+        ContentRecord, KeywordUsage, USAGE_IN_PROGRESS, now_utc, to_iso,
+    )
+    from osmu_kr.publisher import MockPublisher, Publisher
+
+    s = _publish_setup_sqlite()
+    # 콘텐츠 + 진행 중인 usage 한 건
+    s.append_content(ContentRecord(
+        id="c-1", keyword="적금 추천", title="적금 추천 가이드",
+        status="승인완료", refined_post="<h1>적금 추천</h1><p>본문</p>",
+        # min_draft_minutes 통과를 위해 created_at 을 1시간 전으로
+        created_at=to_iso(now_utc() - timedelta(hours=1)),
+    ))
+    s.upsert_usage(KeywordUsage(
+        id="u-1", keyword_id="kw-1", contents_id="c-1",
+        blog_id="myblog", status=USAGE_IN_PROGRESS,
+    ))
+
+    pub = Publisher(s, backend=MockPublisher())
+    res = pub.publish("c-1")
+    assert res.success, res.summary()
+    rec = next(r for r in s.list_content() if r.id == "c-1")
+    assert rec.status == "발행완료"
+    assert rec.platform_url
+    # usage 도 published 로 전이
+    u = s.get_active_usage("kw-1")
+    assert u is None   # 더 이상 in_progress 아님
+    s.close()
+
+
+def test_publisher_blocks_when_draft_too_fresh():
+    """min_draft_minutes 미만이면 차단."""
+    from osmu_kr.models import ContentRecord, now_utc, to_iso
+    from osmu_kr.publisher import MockPublisher, Publisher
+
+    s = _publish_setup_sqlite()
+    # created_at = 방금 — min_draft_minutes (30) 미만
+    s.append_content(ContentRecord(
+        id="c-2", keyword="적금", refined_post="<h1>x</h1>",
+        created_at=to_iso(now_utc()),
+    ))
+    pub = Publisher(s, backend=MockPublisher())
+    res = pub.publish("c-2")
+    assert not res.success
+    assert "draft_too_fresh" in res.blocked_reason
+    s.close()
+
+
+def test_publisher_blocks_daily_limit():
+    """daily_limit 초과 시 차단."""
+    from datetime import timedelta
+    from osmu_kr.models import (
+        ContentRecord, KeywordUsage, USAGE_PUBLISHED, now_utc, to_iso,
+    )
+    from osmu_kr.publisher import MockPublisher, Publisher
+
+    s = _publish_setup_sqlite()
+    today = now_utc()
+    # 오늘 이미 2건 published 된 상태
+    for i in range(2):
+        s.upsert_usage(KeywordUsage(
+            id=f"u-pub-{i}", keyword_id=f"kw-{i}",
+            contents_id=f"prev-{i}", blog_id="myblog",
+            status=USAGE_PUBLISHED,
+            started_at=to_iso(today - timedelta(hours=2 + i)),
+            published_at=to_iso(today - timedelta(hours=1 + i)),
+        ))
+    # 새 콘텐츠 발행 시도 (draft 충분히 오래됨)
+    s.append_content(ContentRecord(
+        id="c-3", keyword="적금", refined_post="<h1>x</h1>",
+        created_at=to_iso(today - timedelta(hours=2)),
+    ))
+    pub = Publisher(s, backend=MockPublisher())
+    res = pub.publish("c-3")
+    assert not res.success
+    assert "daily_limit_exceeded" in res.blocked_reason
+    s.close()
+
+
+def test_publisher_tistory_blocked_without_real_env():
+    """OSMU_PUBLISH_REAL 가 없으면 TistoryPlaywrightPublisher 가 드라이런 메시지."""
+    import os
+    from osmu_kr.models import ContentRecord, now_utc, to_iso
+    from osmu_kr.publisher import Publisher, TistoryPlaywrightPublisher
+
+    saved = os.environ.pop("OSMU_PUBLISH_REAL", None)
+    s = _publish_setup_sqlite()
+    # 콘텐츠 준비 (게이트 통과를 위해 충분히 오래된 draft)
+    from datetime import timedelta
+    s.append_content(ContentRecord(
+        id="c-t", keyword="적금", refined_post="<h1>x</h1>",
+        created_at=to_iso(now_utc() - timedelta(hours=2)),
+    ))
+    try:
+        pub = Publisher(s, backend=TistoryPlaywrightPublisher())
+        res = pub.publish("c-t")
+        assert not res.success
+        assert "OSMU_PUBLISH_REAL" in res.error
+    finally:
+        if saved is not None:
+            os.environ["OSMU_PUBLISH_REAL"] = saved
+        s.close()
+
+
+def test_checker_passes_well_formed_html():
+    """next-3: 잘 만든 HTML 통과."""
+    from osmu_kr.checker import Checker
+    body_p = "<p>적금 추천 비교 본문입니다. 수익률·우대조건을 살펴봅니다.</p>"
+    html = (
+        "<h1>적금 추천</h1>"
+        + body_p * 20
+        + "<h2>섹션 1 — 적금 추천 핵심</h2>"
+        + body_p * 15
+        + '<img alt="적금 비교 이미지" src="https://i/1.jpg">'
+        + "<h2>섹션 2 — 적금 비교</h2>"
+        + body_p * 15
+        + "<h2>섹션 3 — 마무리</h2>"
+        + body_p * 15
+    )
+    chk = Checker()
+    res = chk.run(html, expected_image_count=1)
+    assert res.passed, f"issues={res.issues}"
+    assert res.h1_count == 1
+    assert res.h2_count == 3
+    assert res.img_with_alt == 1
+
+
+def test_checker_flags_short_html_and_missing_alt():
+    """next-3: 길이 부족 + alt 누락 자동 catch."""
+    from osmu_kr.checker import Checker
+    html = '<h1>x</h1><h2>y</h2><p>too short</p><img src="https://i/1.jpg">'
+    chk = Checker()
+    res = chk.run(html, expected_image_count=1)
+    assert not res.passed
+    assert any("char_count_too_low" in i for i in res.issues)
+    assert any("h2_count_out_of_range" in i for i in res.issues)
+    assert any("image_alt_missing" in i for i in res.issues)
+
+
+def test_checker_keywords_present_check_with_blueprint():
+    """next-3: assigned_keywords / commercial recommendations 가 본문에 등장하는지."""
+    from osmu_kr.checker import Checker
+    from osmu_kr.content_generator.blueprint import generate_blueprint
+    from osmu_kr.content_generator.keyword_context import KeywordContext
+
+    bp = generate_blueprint(KeywordContext.from_keyword("적금 추천"), use_llm=False)
+    # 본문에 키워드 있는 케이스
+    good = (
+        "<h1>적금 추천</h1>"
+        + ("<p>적금 추천에 대해 알아봅니다. 수익률 비교.</p>" * 8)
+        + "<h2>1</h2><p>본문.</p>" * 4
+    )
+    chk = Checker()
+    res = chk.run(good, blueprint=bp)
+    assert "적금 추천" in res.keywords_present
+
+
+def test_checker_plagiarism_high_when_article_quotes_facts():
+    """next-3: article 문장이 source 와 거의 같으면 plagiarism_max_sentence 높음."""
+    import os
+    os.environ["OSMU_EMBEDDER"] = "stub"
+    from osmu_kr.checker import Checker
+    from osmu_kr.content_generator.phase2 import FactItem, Phase2Result
+
+    src = "데드바이데이라이트는 4vs1 비대칭 호러 게임으로 생존자가 발전기를 수리해 탈출합니다."
+    # h1 / p 끝에 마침표 — 본문에 src 가 독립 문장으로 추출되도록
+    html = (
+        "<h1>DBD 초보 공략.</h1>"
+        + f"<p>{src}</p>"
+        + "<h2>섹션.</h2><p>본문입니다.</p>" * 6
+    )
+    phase2 = Phase2Result(keyword="DBD")
+    phase2.sources_by_section = {2: [FactItem(fact_text=src, source_url="x")]}
+
+    chk = Checker()
+    res = chk.run(html, normalized_sources=phase2)
+    assert res.plagiarism_max_sentence > 0.5, (
+        f"max_sentence={res.plagiarism_max_sentence:.3f} — "
+        f"stub embed 가 동일 문장에 대해 cosine ≈ 1.0 을 줘야 함"
+    )
+
+
+def test_cli_config_set_and_get():
+    """next-2: CLI config-set/config-get 라운드트립."""
+    import io, os
+    from contextlib import redirect_stdout
+    from osmu_kr.cli import main as cli_main
+
+    _cli_use_sqlite_backend()
+    saved_legacy = os.environ.pop("OSMU_GOLDEN_THRESHOLD", None)
+    saved_new = os.environ.pop("OSMU_KEYWORD_GOLDEN_THRESHOLD", None)
+    try:
+        buf1 = io.StringIO()
+        with redirect_stdout(buf1):
+            rc = cli_main(["config-set", "--key", "keyword.golden_threshold",
+                            "--value", "62"])
+        assert rc == 0
+        assert "62" in buf1.getvalue()
+
+        buf2 = io.StringIO()
+        with redirect_stdout(buf2):
+            rc = cli_main(["config-get", "--key", "keyword.golden_threshold"])
+        assert rc == 0
+        out = buf2.getvalue()
+        assert "'62'" in out
+        assert "source=db" in out
+    finally:
+        if saved_legacy is not None:
+            os.environ["OSMU_GOLDEN_THRESHOLD"] = saved_legacy
+        if saved_new is not None:
+            os.environ["OSMU_KEYWORD_GOLDEN_THRESHOLD"] = saved_new
+
+
+def test_cli_account_add_and_list():
+    """next-2: CLI account-add → account-list."""
+    import io
+    from contextlib import redirect_stdout
+    from osmu_kr.cli import main as cli_main
+
+    _cli_use_sqlite_backend()
+    rc = cli_main(["account-add", "--id", "acc-cli-001",
+                    "--blog-id", "myblog", "--login-id", "me@kakao.com"])
+    assert rc == 0
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli_main(["account-list"])
+    assert rc == 0
+    out = buf.getvalue()
+    assert "acc-cli-001" in out
+    assert "myblog" in out
+
+
+def test_cli_housekeeping_runs_without_error():
+    """next-2: CLI housekeeping 실행."""
+    import io
+    from contextlib import redirect_stdout
+    from osmu_kr.cli import main as cli_main
+
+    _cli_use_sqlite_backend()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli_main(["housekeeping"])
+    assert rc == 0
+    assert "housekeeping" in buf.getvalue()
+
+
 def test_cm_base_writer_default_write_from_blueprint_delegates_to_write():
     """cm-A: BaseWriter.write_from_blueprint default 구현이 write() 에 위임."""
     from osmu_kr.content_generator.blueprint import generate_blueprint
@@ -2754,6 +3027,17 @@ TESTS = [
     test_recommend_v13_excludes_active_lock_and_published_in_blog,
     test_v13_grade_thresholds,
     test_v13_researcher_uses_config_golden_threshold,
+    test_publisher_mock_publishes_successfully,
+    test_publisher_blocks_when_draft_too_fresh,
+    test_publisher_blocks_daily_limit,
+    test_publisher_tistory_blocked_without_real_env,
+    test_checker_passes_well_formed_html,
+    test_checker_flags_short_html_and_missing_alt,
+    test_checker_keywords_present_check_with_blueprint,
+    test_checker_plagiarism_high_when_article_quotes_facts,
+    test_cli_config_set_and_get,
+    test_cli_account_add_and_list,
+    test_cli_housekeeping_runs_without_error,
     test_cm_base_writer_default_write_from_blueprint_delegates_to_write,
     test_cm_generator_uses_blueprint_writer_path,
     test_v13f_accounts_round_trip_in_sqlite,

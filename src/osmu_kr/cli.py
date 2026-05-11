@@ -35,7 +35,41 @@ def main(argv=None) -> int:
     sub.add_parser("manage")    # 정기 점검 — cron 등 자동화용
     sub.add_parser("history")   # 분석 이력 조회
     sub.add_parser("show")
-    sub.add_parser("config")
+    sub.add_parser("config")        # legacy: cfg.summary() 출력 (호환)
+
+    # ── v13: config 테이블 운영 명령 ──
+    s_cfg_get = sub.add_parser("config-get",
+                                 help="config 값 조회 (env > db > default)")
+    s_cfg_get.add_argument("--key", required=True,
+                              help="dot notation 키 (예: keyword.golden_threshold)")
+
+    s_cfg_set = sub.add_parser("config-set",
+                                 help="config DB 값 설정 (환경변수가 있으면 우선)")
+    s_cfg_set.add_argument("--key", required=True)
+    s_cfg_set.add_argument("--value", required=True)
+
+    sub.add_parser("config-list",
+                     help="모든 config 항목 + 출처(env/db/default) 표시")
+
+    s_cfg_install = sub.add_parser("config-install-defaults",
+                                      help="DEFAULTS 19개 항목을 DB 에 부트스트랩")
+    s_cfg_install.add_argument("--overwrite", action="store_true")
+
+    # ── v13-E: housekeeping 수동 트리거 ──
+    sub.add_parser("housekeeping",
+                     help="revival 재평가 + 풀삭제 정책 즉시 실행")
+
+    # ── v13-F: accounts CRUD ──
+    s_acc_add = sub.add_parser("account-add",
+                                 help="Tistory 등 발행 계정 등록")
+    s_acc_add.add_argument("--id", required=True)
+    s_acc_add.add_argument("--blog-id", required=True)
+    s_acc_add.add_argument("--platform", default="tistory")
+    s_acc_add.add_argument("--login-id", default="")
+    s_acc_add.add_argument("--cookie-path", default="")
+    s_acc_add.add_argument("--note", default="")
+
+    sub.add_parser("account-list", help="등록된 계정 목록")
 
     # ── 신규: 콘텐츠 생성 ──
     s_gen = sub.add_parser("generate", help="키워드 → Firecrawl 검색 → SEO HTML 생성")
@@ -69,6 +103,59 @@ def main(argv=None) -> int:
 
     if args.cmd == "config":
         print(cfg.summary()); return 0
+
+    # ── v13: config 테이블 ──
+    if args.cmd == "config-get":
+        v = rs.config_mgr.get(args.key)
+        src = rs.config_mgr.get_source(args.key)
+        print(f"{args.key} = {v!r} (source={src})")
+        return 0
+    if args.cmd == "config-set":
+        rs.config_mgr.set(args.key, args.value)
+        print(f"✅ {args.key} = {args.value!r} (DB)")
+        return 0
+    if args.cmd == "config-list":
+        for entry in rs.config_mgr.dump():
+            print(f"  {entry['key']:50s} = {entry['value']!r:>10}  [{entry['source']}]")
+        return 0
+    if args.cmd == "config-install-defaults":
+        n = rs.config_mgr.install_defaults(overwrite=args.overwrite)
+        print(f"✅ DB 에 {n} 개 항목 적재"
+              + (" (overwrite=True)" if args.overwrite else ""))
+        return 0
+
+    # ── v13-E: housekeeping ──
+    if args.cmd == "housekeeping":
+        from .researcher.housekeeping import Housekeeping
+        hk = Housekeeping(rs.storage, evaluator=rs.evaluator,
+                           config_mgr=rs.config_mgr)
+        report = hk.run()
+        print("=" * 60)
+        print("  🧹 housekeeping 실행 결과")
+        print("=" * 60)
+        print(f"  {report.summary()}")
+        return 0
+
+    # ── v13-F: accounts ──
+    if args.cmd == "account-add":
+        from .models import Account
+        rs.storage.upsert_account(Account(
+            id=args.id, platform=args.platform, blog_id=args.blog_id,
+            login_id=args.login_id, cookie_path=args.cookie_path,
+            note=args.note,
+        ))
+        print(f"✅ 계정 등록: {args.id} ({args.platform}/{args.blog_id})")
+        return 0
+    if args.cmd == "account-list":
+        accounts = rs.storage.list_accounts()
+        if not accounts:
+            print("(등록된 계정 없음)")
+            return 0
+        for a in accounts:
+            mark = "✅" if a.is_active else "⏸"
+            print(f"  {mark} {a.id} | {a.platform}/{a.blog_id} | "
+                  f"login={a.login_id or '-'} | cookie={a.cookie_path or '-'}")
+        return 0
     if args.cmd == "seed":
         rep = rs.run_seed(args.seed, expand_limit=args.limit)
         print(rep.summary()); return 0
