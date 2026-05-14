@@ -71,6 +71,29 @@ def main(argv=None) -> int:
 
     sub.add_parser("account-list", help="등록된 계정 목록")
 
+    # ── ops-3: 검토/승인/발행 파이프라인 CLI ──
+    s_check = sub.add_parser("check-content",
+                                help="콘텐츠 시스템 검증 (checker Stage 1)")
+    s_check.add_argument("--id", required=True)
+    s_check.add_argument("--submit", action="store_true",
+                            help="통과 시 Slack 검토 요청 전송 (status→사용자검토중)")
+
+    s_app = sub.add_parser("approve", help="콘텐츠 사람 검토 승인 (Stage 2)")
+    s_app.add_argument("--id", required=True)
+
+    s_rej = sub.add_parser("reject", help="콘텐츠 사람 검토 거절 (Stage 2)")
+    s_rej.add_argument("--id", required=True)
+    s_rej.add_argument("--reason", default="")
+
+    s_pub = sub.add_parser("publish", help="콘텐츠 발행 (publisher)")
+    s_pub.add_argument("--id", required=True)
+    s_pub.add_argument("--account-id", default="",
+                          help="(옵션) 특정 계정 — 안 주면 active Tistory 계정")
+    s_pub.add_argument("--mock", action="store_true",
+                          help="MockPublisher 사용 (드라이런)")
+    s_pub.add_argument("--skip-gates", action="store_true",
+                          help="발행 게이트 4종 우회 (디버깅용)")
+
     # ── 신규: 콘텐츠 생성 ──
     s_gen = sub.add_parser("generate", help="키워드 → Firecrawl 검색 → SEO HTML 생성")
     s_gen.add_argument("--keyword", required=True)
@@ -146,6 +169,93 @@ def main(argv=None) -> int:
         ))
         print(f"✅ 계정 등록: {args.id} ({args.platform}/{args.blog_id})")
         return 0
+    # ── ops-3: check / approve / reject / publish ──
+    if args.cmd == "check-content":
+        from .checker import Checker
+        rec = next((r for r in rs.storage.list_content() if r.id == args.id), None)
+        if rec is None:
+            print(f"❌ id={args.id} 콘텐츠 없음")
+            return 1
+        chk = Checker(config_mgr=rs.config_mgr)
+        # blueprint / normalized_sources 는 JSON 컬럼에서 재구성 — v1 단순 검증은 본문만
+        result = chk.run(rec.refined_post)
+        print("=" * 60)
+        print(f"  🔍 시스템 검증 결과 (id={rec.id})")
+        print("=" * 60)
+        print(f"  {result.summary()}")
+        for i in result.issues:
+            print(f"  ❌ {i}")
+        for w in result.warnings:
+            print(f"  ⚠️  {w}")
+        rs.storage.update_content(
+            rec.id,
+            plagiarism_overall=result.plagiarism_overall if hasattr(rec, "plagiarism_overall") else None,
+        )
+        if result.passed and args.submit:
+            from .notifications import submit_for_review
+            sub_res = submit_for_review(
+                content_id=rec.id,
+                title=rec.title or rec.title_final or rec.keyword,
+                check_result=result,
+            )
+            rs.storage.update_content(rec.id, status="사용자검토중")
+            print(f"\n  📤 검토 요청 전송: sent={sub_res.sent} ({sub_res.error or 'ok'})")
+        return 0 if result.passed else 1
+
+    if args.cmd == "approve":
+        rec = next((r for r in rs.storage.list_content() if r.id == args.id), None)
+        if rec is None:
+            print(f"❌ id={args.id} 없음")
+            return 1
+        rs.storage.update_content(rec.id, status="승인완료")
+        print(f"✅ id={rec.id} 승인완료 — `osmu-kr publish --id {rec.id}` 로 발행")
+        return 0
+
+    if args.cmd == "reject":
+        from .researcher.safety import SafetyLayer
+        rec = next((r for r in rs.storage.list_content() if r.id == args.id), None)
+        if rec is None:
+            print(f"❌ id={args.id} 없음")
+            return 1
+        rs.storage.update_content(
+            rec.id, status="실패",
+            error_log=(rec.error_log + f" | rejected: {args.reason}").strip(" |"),
+        )
+        # keyword_usages 도 failed 로 — 잠금 해제
+        safety = SafetyLayer(rs.storage)
+        for u in rs.storage.list_usages():
+            if u.contents_id == rec.id and u.status == "in_progress":
+                safety.mark_failed(u.id, note=f"rejected: {args.reason}")
+                break
+        print(f"❌ id={rec.id} 거절 — reason='{args.reason}', 키워드 잠금 해제됨")
+        return 0
+
+    if args.cmd == "publish":
+        from .publisher import MockPublisher, Publisher, TistoryPlaywrightPublisher
+        rec = next((r for r in rs.storage.list_content() if r.id == args.id), None)
+        if rec is None:
+            print(f"❌ id={args.id} 없음")
+            return 1
+        backend = MockPublisher() if args.mock else TistoryPlaywrightPublisher(
+            config_mgr=rs.config_mgr,
+        )
+        account = (rs.storage.get_account(args.account_id)
+                    if args.account_id else None)
+        pub = Publisher(rs.storage, backend=backend, config_mgr=rs.config_mgr)
+        result = pub.publish(args.id, account=account, skip_gates=args.skip_gates)
+        print("=" * 60)
+        print(f"  🚀 발행 결과 (id={args.id})")
+        print("=" * 60)
+        print(f"  {result.summary()}")
+        if result.success:
+            from .notifications import notify_publish_done
+            notify_publish_done(
+                content_id=args.id,
+                title=rec.title or rec.title_final or rec.keyword,
+                platform_url=result.platform_url,
+            )
+        return 0 if result.success else 1
+
     if args.cmd == "account-list":
         accounts = rs.storage.list_accounts()
         if not accounts:

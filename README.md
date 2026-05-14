@@ -328,7 +328,7 @@ osmu-kr delete-content --id 042
 
 ```bash
 OSMU_EMBEDDER=stub PYTHONPATH=src python tests/test_basic.py
-# result: 113/113 passed
+# result: 116/116 passed
 ```
 
 GitHub Actions(`tests.yml`)는 push/PR마다 Python 3.10/3.11/3.12 + macOS-latest 매트릭스로 자동 실행. 테스트 환경에서는 `OSMU_EMBEDDER=stub` 강제로 ko-sroberta 다운로드를 회피.
@@ -380,8 +380,12 @@ GitHub Actions(`tests.yml`)는 push/PR마다 Python 3.10/3.11/3.12 + macOS-lates
 - [x] checker Stage 2 진입점 — `submit_for_review()` + Slack 알림 (notifications.py)
 - [x] publisher — 발행 게이트 4종 + MockPublisher
 - [x] publisher — Tistory Playwright 실 자동화 흐름 (OSMU_PUBLISH_REAL=1 가드)
-- [ ] **운영 진입** — 실 운영 시 Tistory DOM 셀렉터 검증 + 쿠키 캡처 워크플로우
-- [ ] 사람 검토 대시보드 UI — Slack 답글 vs Streamlit 인라인 편집 (UX 결정)
+- [x] Tistory 쿠키 캡처 스크립트 — `scripts/capture_tistory_cookie.py`
+- [x] Tistory DOM 셀렉터 config 분리 — `tistory.selector.title/body/publish`
+- [x] CLI — `check-content`, `approve`, `reject`, `publish` 명령
+- [x] Streamlit 검토 UI — `ui/pages/7_검토_승인.py`
+- [x] keyword_usages timeout 자동 처리 — housekeeping 안에서 24h 초과 자동 failed
+- [ ] **운영 진입** — 실 Tistory DOM 셀렉터 확정 (쿠키 캡처 후 첫 발행하면서)
 - [ ] checker — 자기잠식·표절·구조 두 단계 게이트
 - [ ] publisher — 티스토리 Playwright + 어뷰징 게이트
 - [ ] PostgreSQL + pgvector — 임베딩 기반 자기잠식 검색을 DB 안에서

@@ -16,6 +16,15 @@ service_account*.json
 *.pem
 *.key
 
+# Tistory 쿠키 (capture_tistory_cookie.py 산출물)
+cookies/
+
+# SQLite DB
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 data/
 *.csv
 !demos/**/*.csv

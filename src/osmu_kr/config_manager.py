@@ -52,6 +52,8 @@ DEFAULTS: Dict[str, Any] = {
     "publisher.min_draft_minutes":            30,
     "publisher.similarity_cooldown_threshold": 0.85,
     "publisher.similarity_cooldown_days":     3,
+    # housekeeping.*
+    "housekeeping.inprogress_timeout_hours":  24,    # ops-5: in_progress lock 자동 해제
 }
 
 # ── legacy 환경변수 호환 — 기존 이름이 환경에 박혀있어도 인식 ─────

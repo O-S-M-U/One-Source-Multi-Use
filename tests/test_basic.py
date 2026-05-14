@@ -2466,6 +2466,120 @@ def test_cli_account_add_and_list():
     assert "myblog" in out
 
 
+def test_ops5_housekeeping_times_out_stale_inprogress_lock():
+    """ops-5: in_progress 가 timeout 시간 초과면 자동 failed."""
+    from datetime import timedelta
+    from osmu_kr.models import (
+        KeywordUsage, USAGE_FAILED, USAGE_IN_PROGRESS, now_utc, to_iso,
+    )
+    from osmu_kr.researcher.housekeeping import Housekeeping
+
+    rs = fresh_researcher()
+    # timeout 1시간으로 세팅
+    rs.config_mgr.set("housekeeping.inprogress_timeout_hours", 1)
+    rs.config_mgr.set("keyword.revival_days", 99999)   # revival 비활성
+
+    # 2시간 전 시작된 in_progress 한 건
+    rs.storage.upsert_usage(KeywordUsage(
+        id="u-stale", keyword_id="kw-x", contents_id="c-x",
+        status=USAGE_IN_PROGRESS,
+        started_at=to_iso(now_utc() - timedelta(hours=2)),
+    ))
+    # 방금 시작된 한 건 (timeout 안 걸려야 함)
+    rs.storage.upsert_usage(KeywordUsage(
+        id="u-fresh", keyword_id="kw-y", contents_id="c-y",
+        status=USAGE_IN_PROGRESS,
+        started_at=to_iso(now_utc() - timedelta(minutes=10)),
+    ))
+
+    hk = Housekeeping(rs.storage, evaluator=None, config_mgr=rs.config_mgr)
+    report = hk.run()
+    assert report.timed_out_locks == 1
+
+    stale = next(u for u in rs.storage.list_usages() if u.id == "u-stale")
+    fresh = next(u for u in rs.storage.list_usages() if u.id == "u-fresh")
+    assert stale.status == USAGE_FAILED
+    assert "auto_timeout" in stale.note
+    assert fresh.status == USAGE_IN_PROGRESS   # 살아있어야 함
+
+
+def test_cli_publish_command_with_mock():
+    """ops-3: CLI publish --mock 명령."""
+    import io, os, tempfile
+    from contextlib import redirect_stdout
+    from datetime import timedelta
+    from osmu_kr.cli import main as cli_main
+    from osmu_kr.models import Account, ContentRecord, now_utc, to_iso
+
+    tmp = tempfile.mkdtemp(prefix="osmu_cli_pub_")
+    os.environ["OSMU_STORAGE_BACKEND"] = "sqlite"
+    os.environ["OSMU_SQLITE_PATH"] = os.path.join(tmp, "x.db")
+
+    # 콘텐츠 + 활성 계정 미리 등록
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+    s = SqliteStorage(db_path=os.environ["OSMU_SQLITE_PATH"])
+    s.upsert_account(Account(id="acc-1", platform="tistory",
+                              blog_id="myblog", is_active=1))
+    s.append_content(ContentRecord(
+        id="c-cli-1", keyword="적금 추천", title="t",
+        status="승인완료", refined_post="<h1>x</h1><p>본문</p>",
+        created_at=to_iso(now_utc() - timedelta(hours=2)),
+    ))
+    s.close()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli_main(["publish", "--id", "c-cli-1", "--mock"])
+    assert rc == 0, buf.getvalue()
+    assert "published" in buf.getvalue().lower()
+
+
+def test_cli_approve_and_reject_commands():
+    """ops-3: CLI approve / reject 명령."""
+    import io, os, tempfile
+    from contextlib import redirect_stdout
+    from osmu_kr.cli import main as cli_main
+    from osmu_kr.models import ContentRecord, KeywordPoolItem, KeywordUsage, USAGE_IN_PROGRESS
+
+    tmp = tempfile.mkdtemp(prefix="osmu_cli_ar_")
+    os.environ["OSMU_STORAGE_BACKEND"] = "sqlite"
+    os.environ["OSMU_SQLITE_PATH"] = os.path.join(tmp, "x.db")
+
+    from osmu_kr.storage.sqlite_local import SqliteStorage
+    s = SqliteStorage(db_path=os.environ["OSMU_SQLITE_PATH"])
+    # 콘텐츠 1 — 승인 대상
+    s.append_content(ContentRecord(id="c-ap", keyword="approve_me", status="사용자검토중",
+                                      refined_post="<h1>x</h1>"))
+    # 콘텐츠 2 — 거절 대상 + keyword_usages lock 풀기 시나리오
+    s.append_content(ContentRecord(id="c-rj", keyword="reject_me", status="사용자검토중",
+                                      refined_post="<h1>y</h1>"))
+    s.upsert_usage(KeywordUsage(id="u-rj", keyword_id="kw-rj", contents_id="c-rj",
+                                  status=USAGE_IN_PROGRESS))
+    s.close()
+
+    # approve
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli_main(["approve", "--id", "c-ap"])
+    assert rc == 0
+    # reject
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli_main(["reject", "--id", "c-rj", "--reason", "quality_low"])
+    assert rc == 0
+
+    # 검증
+    s2 = SqliteStorage(db_path=os.environ["OSMU_SQLITE_PATH"])
+    approved = next(r for r in s2.list_content() if r.id == "c-ap")
+    rejected = next(r for r in s2.list_content() if r.id == "c-rj")
+    assert approved.status == "승인완료"
+    assert rejected.status == "실패"
+    # keyword_usages 도 failed 로 — 잠금 해제
+    u = next(u for u in s2.list_usages() if u.id == "u-rj")
+    assert u.status == "failed"
+    s2.close()
+
+
 def test_cli_housekeeping_runs_without_error():
     """next-2: CLI housekeeping 실행."""
     import io
@@ -2848,13 +2962,13 @@ def test_config_manager_install_defaults():
     rs = fresh_researcher()
     cm = ConfigManager(rs.storage)
     n = cm.install_defaults()
-    assert n == len(DEFAULTS) == 19
+    assert n == len(DEFAULTS)
     # 두 번째 호출은 이미 있으니 0
     n2 = cm.install_defaults()
     assert n2 == 0
-    # overwrite=True 면 다시 19개
+    # overwrite=True 면 다시 전체
     n3 = cm.install_defaults(overwrite=True)
-    assert n3 == 19
+    assert n3 == len(DEFAULTS)
 
 
 def test_keyword_usages_round_trip_in_sqlite():
@@ -3077,6 +3191,9 @@ TESTS = [
     test_cli_config_set_and_get,
     test_cli_account_add_and_list,
     test_cli_housekeeping_runs_without_error,
+    test_ops5_housekeeping_times_out_stale_inprogress_lock,
+    test_cli_publish_command_with_mock,
+    test_cli_approve_and_reject_commands,
     test_cm_base_writer_default_write_from_blueprint_delegates_to_write,
     test_cm_generator_uses_blueprint_writer_path,
     test_v13f_accounts_round_trip_in_sqlite,

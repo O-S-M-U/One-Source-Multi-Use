@@ -44,13 +44,15 @@ class HousekeepingReport:
     evicted_fallback: int = 0    # 2순위 — last_evaluated_at + total_score
     pool_size_before: int = 0
     pool_size_after: int = 0
+    timed_out_locks: int = 0     # ops-5: in_progress 자동 failed
     notes: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"re_eval={self.re_evaluated} archived={self.archived_low_quality} "
             f"evict[1순위={self.evicted_primary} 2순위={self.evicted_fallback}] "
-            f"pool {self.pool_size_before}→{self.pool_size_after}"
+            f"pool {self.pool_size_before}→{self.pool_size_after} "
+            f"timeouts={self.timed_out_locks}"
         )
 
 
@@ -67,6 +69,9 @@ class Housekeeping:
         report = HousekeepingReport()
         pool = self._active_pool()
         report.pool_size_before = len(pool)
+
+        # 0) ops-5: in_progress lock timeout 자동 처리
+        report.timed_out_locks = self._timeout_inprogress_locks()
 
         # 1) revival 재평가
         if self.evaluator is not None:
@@ -203,6 +208,42 @@ class Housekeeping:
             evicted.append(c)
             log.info("[housekeeping] 2순위 eviction: %s", c.keyword_id)
         return evicted
+
+    # ── ops-5: in_progress timeout 자동 failed ─────────
+    def _timeout_inprogress_locks(self) -> int:
+        """OSMU 핵심 안전장치 — in_progress 가 너무 오래 지속되면 자동 failed.
+
+        - 임계: housekeeping.inprogress_timeout_hours (default 24)
+        - keyword_usages.started_at 기준
+        """
+        from .safety import SafetyLayer
+
+        timeout_h = self.config_mgr.get_float(
+            "housekeeping.inprogress_timeout_hours", 24.0,
+        )
+        if timeout_h <= 0:
+            return 0
+        cutoff = now_utc() - timedelta(hours=timeout_h)
+        safety = SafetyLayer(self.storage)
+        count = 0
+        for u in self.storage.list_usages():
+            if u.status != "in_progress":
+                continue
+            try:
+                started = from_iso(u.started_at) if u.started_at else None
+            except Exception:
+                continue
+            if started is None or started >= cutoff:
+                continue
+            try:
+                safety.mark_failed(u.id,
+                                     note=f"auto_timeout: {timeout_h}h 초과")
+                count += 1
+                log.warning("[housekeeping] timeout → failed: usage=%s keyword=%s",
+                             u.id, u.keyword_id)
+            except Exception as e:
+                log.warning("[housekeeping] timeout 처리 실패 (%s): %s", u.id, e)
+        return count
 
     # ── 헬퍼 ──────────────────────────────────────────
     def _active_pool(self) -> List[KeywordPoolItem]:

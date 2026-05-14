@@ -98,11 +98,52 @@ class TistoryPlaywrightPublisher(BasePublisher):
     """
     name = "tistory_playwright"
 
+    # ── DOM 셀렉터 default — config 로 override 가능 ──
+    # 실제 운영하면서 Tistory 가 selector 를 바꾸면 config 만 갱신:
+    #   osmu-kr config-set --key tistory.selector.title --value "input[placeholder='제목']"
+    DEFAULT_SELECTORS = {
+        "title": [
+            "#title",
+            'input[name="title"]',
+            'input[placeholder*="제목"]',
+        ],
+        "body": [
+            "textarea#content",
+            'textarea[name="content"]',
+            ".tox-edit-area iframe",
+        ],
+        "publish": [
+            "button#publish",
+            "button.btn-publish",
+            'button:has-text("공개 발행")',
+            'button:has-text("발행")',
+        ],
+        "success_url_pattern": "**/entry/**",
+    }
+
     def __init__(self, *, headless: bool = False, slow_mo: int = 100,
-                 timeout: int = 30_000):
+                 timeout: int = 30_000, config_mgr=None):
         self.headless = headless
         self.slow_mo = slow_mo
         self.timeout = timeout
+        self.config_mgr = config_mgr
+
+    def _selectors(self, role: str) -> list:
+        """DB config 우선 (콤마 구분 문자열) → DEFAULTS 폴백."""
+        if self.config_mgr is not None:
+            raw = self.config_mgr.get(f"tistory.selector.{role}")
+            if raw:
+                if isinstance(raw, list):
+                    return list(raw)
+                return [s.strip() for s in str(raw).split(",") if s.strip()]
+        return list(self.DEFAULT_SELECTORS.get(role, []))
+
+    def _success_url_pattern(self) -> str:
+        if self.config_mgr is not None:
+            v = self.config_mgr.get("tistory.success_url_pattern")
+            if v:
+                return str(v)
+        return self.DEFAULT_SELECTORS["success_url_pattern"]
 
     def publish(self, *, title, html, account, contents_id=""):
         if os.environ.get("OSMU_PUBLISH_REAL", "").strip() not in {"1", "true", "yes"}:
@@ -165,21 +206,17 @@ class TistoryPlaywrightPublisher(BasePublisher):
                             error=f"쿠키 만료 의심 — 재로그인 필요 (redirected to {page.url})",
                         )
 
-                    # 제목 입력 — placeholder 또는 #title 류 셀렉터 시도
-                    title_selectors = ['#title', 'input[name="title"]',
-                                        'input[placeholder*="제목"]']
-                    for sel in title_selectors:
+                    # 제목 입력 — config 또는 DEFAULTS 셀렉터
+                    for sel in self._selectors("title"):
                         try:
                             page.fill(sel, title)
                             break
                         except Exception:
                             continue
 
-                    # 본문 (HTML 모드) — 에디터 토글이 필요할 수 있음. v1 단순 시도.
-                    body_selectors = ['textarea#content', 'textarea[name="content"]',
-                                       '.tox-edit-area iframe']
+                    # 본문 — config 또는 DEFAULTS 셀렉터
                     body_inserted = False
-                    for sel in body_selectors:
+                    for sel in self._selectors("body"):
                         try:
                             page.fill(sel, html)
                             body_inserted = True
@@ -187,20 +224,15 @@ class TistoryPlaywrightPublisher(BasePublisher):
                         except Exception:
                             continue
                     if not body_inserted:
-                        # fallback — JS 로 html 직접 주입
                         page.evaluate(
                             "(html) => { const ta=document.querySelector('textarea'); "
                             "if (ta) ta.value=html; }",
                             html,
                         )
 
-                    # 발행 버튼 — 셀렉터는 운영 시 검증
-                    publish_selectors = [
-                        'button#publish', 'button.btn-publish',
-                        'button:has-text("공개 발행")', 'button:has-text("발행")',
-                    ]
+                    # 발행 버튼
                     clicked = False
-                    for sel in publish_selectors:
+                    for sel in self._selectors("publish"):
                         try:
                             page.click(sel, timeout=5000)
                             clicked = True
@@ -210,11 +242,11 @@ class TistoryPlaywrightPublisher(BasePublisher):
                     if not clicked:
                         return PublishResult(
                             success=False,
-                            error="발행 버튼 클릭 실패 — DOM 셀렉터 확인 필요",
+                            error="발행 버튼 클릭 실패 — tistory.selector.publish config 확인",
                         )
 
-                    # 발행 완료 후 URL 추출 (예: /entry/{slug})
-                    page.wait_for_url("**/entry/**", timeout=15_000)
+                    # 발행 완료 후 URL 패턴
+                    page.wait_for_url(self._success_url_pattern(), timeout=15_000)
                     url = page.url
                 finally:
                     browser.close()
