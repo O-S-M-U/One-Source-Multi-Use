@@ -484,10 +484,15 @@ def _normalize_blueprint_obj(obj: dict, ctx: KeywordContext) -> BlueprintResult:
 
 
 # ── 공개 API ───────────────────────────────────────────
+def _blueprint_model_default() -> str:
+    """infra-5: env 또는 코드 default."""
+    return os.environ.get("OSMU_ANTHROPIC_MODEL_BLUEPRINT", "claude-sonnet-4-6")
+
+
 def generate_blueprint(value: Union[KeywordContext, str],
                        *, use_llm: Optional[bool] = None,
                        api_key: Optional[str] = None,
-                       model: str = "claude-sonnet-4-6") -> BlueprintResult:
+                       model: Optional[str] = None) -> BlueprintResult:
     """KeywordContext → BlueprintResult.
 
     Args:
@@ -519,6 +524,7 @@ def generate_blueprint(value: Union[KeywordContext, str],
         return replace(base, source="llm_fallback_rule",
                         raw_signals={**base.raw_signals, "llm_skip": "no_api_key"})
 
+    model = model or _blueprint_model_default()
     user_prompt = _build_user_prompt(ctx)
     last_err: Optional[Exception] = None
     for attempt in (1, 2):

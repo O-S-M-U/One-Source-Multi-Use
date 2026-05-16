@@ -66,41 +66,150 @@ def _fetch_datalab(keyword, client_id, client_secret):
         older = scores[:-4] if len(scores) > 4 else scores[:max(1, len(scores)//2)]
         ra = sum(recent) / max(1, len(recent))
         oa = sum(older) / max(1, len(older))
-        direction = "상승중" if ra > oa * 1.2 else ("하락중" if ra < oa * 0.8 else "유지중")
-        return {"trend_score": avg, "trend_direction": direction, "source": "naver_datalab"}
+        # score-2: slope 정량화 — (recent_avg - older_avg) / older_avg * 100 (%)
+        if oa > 0:
+            slope_pct = round((ra - oa) / oa * 100.0, 1)
+        else:
+            slope_pct = 0.0
+        if slope_pct >= 20.0:
+            direction = "상승중"
+        elif slope_pct <= -20.0:
+            direction = "하락중"
+        else:
+            direction = "유지중"
+        return {
+            "trend_score": avg,
+            "trend_direction": direction,
+            "trend_slope_pct": slope_pct,
+            "recent_avg": round(ra, 2),
+            "older_avg": round(oa, 2),
+            "source": "naver_datalab",
+        }
     except Exception as e:
         log.warning("[naver_golden] DataLab 실패: %s", e)
         return {"trend_score": 0, "trend_direction": "조회실패", "source": "naver_datalab"}
 
 
-def _fetch_blog(keyword, client_id, client_secret):
+def _fetch_shopping_signal(keyword, client_id, client_secret):
+    """score-5: Naver Shopping Search API — 상품 카운트 → 상업적 의도 보강.
+
+    상품이 많이 매치될수록 ‘상업적’ 신호. Total 0 이면 정보성 키워드 비중↑.
+    키 없거나 실패 시 None 반환.
+    """
     if not client_id or not client_secret:
-        return {"total_results": None, "competition_label": "데이터없음",
-                "competition_score": 15, "source": "blog(스킵)"}
+        return None
     try:
         import requests
     except ImportError:
-        return {"total_results": None, "competition_label": "requests 미설치",
-                "competition_score": 15, "source": "blog(requests 미설치)"}
+        return None
     headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
     try:
+        r = requests.get("https://openapi.naver.com/v1/search/shop.json",
+                          headers=headers,
+                          params={"query": keyword, "display": 1},
+                          timeout=8)
+        if r.status_code != 200:
+            return None
+        total = int(r.json().get("total", 0))
+        return total
+    except Exception as e:
+        log.warning("[naver_golden] Shopping 실패: %s", e)
+        return None
+
+
+def _fetch_blog(keyword, client_id, client_secret, *,
+                  recent_window_days: int = 14):
+    """Blog 경쟁도 — v13 spec 대로 두 sub-axis 로 분리.
+
+    Returns:
+      · total_results       : 누적 글 수
+      · competition_score   : 0~15 (총량) — 기존 30점 기준을 절반으로 스케일
+      · recent_count        : 최근 N일 발행 수 (Blog Search API 정렬=date)
+      · recent_density_score: 0~15 (최근 발행 밀도)
+      · combined_score      : 0~30 (두 sub-axis 합)
+    """
+    if not client_id or not client_secret:
+        return {"total_results": None, "recent_count": None,
+                "competition_label": "데이터없음",
+                "competition_score": 7, "recent_density_score": 7,
+                "combined_score": 15, "source": "blog(스킵)"}
+    try:
+        import requests
+    except ImportError:
+        return {"total_results": None, "recent_count": None,
+                "competition_label": "requests 미설치",
+                "competition_score": 7, "recent_density_score": 7,
+                "combined_score": 15, "source": "blog(requests 미설치)"}
+    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
+
+    # ── 1) 총량 ──
+    try:
         r = requests.get("https://openapi.naver.com/v1/search/blog.json",
-                         headers=headers, params={"query": keyword, "display": 5, "sort": "sim"},
+                         headers=headers,
+                         params={"query": keyword, "display": 5, "sort": "sim"},
                          timeout=10)
         r.raise_for_status()
         data = r.json()
         total = data.get("total", 0)
-        if total < BLOG_COMP["very_low"]: score, label = 30, "매우 낮음"
-        elif total < BLOG_COMP["low"]: score, label = 20, "낮음"
-        elif total < BLOG_COMP["medium"]: score, label = 10, "보통"
-        elif total < BLOG_COMP["high"]: score, label = 5, "높음"
-        else: score, label = 0, "매우 높음(레드오션)"
-        return {"total_results": total, "competition_label": label,
-                "competition_score": score, "source": "naver_blog"}
+        # 0~15 점수로 스케일 (기존 30점 → 절반)
+        if total < BLOG_COMP["very_low"]:    total_score, label = 15, "매우 낮음"
+        elif total < BLOG_COMP["low"]:        total_score, label = 11, "낮음"
+        elif total < BLOG_COMP["medium"]:     total_score, label = 7, "보통"
+        elif total < BLOG_COMP["high"]:       total_score, label = 3, "높음"
+        else:                                  total_score, label = 0, "매우 높음(레드오션)"
     except Exception as e:
-        log.warning("[naver_golden] Blog 실패: %s", e)
-        return {"total_results": None, "competition_label": "조회실패",
-                "competition_score": 15, "source": "blog(실패)"}
+        log.warning("[naver_golden] Blog total 실패: %s", e)
+        return {"total_results": None, "recent_count": None,
+                "competition_label": "조회실패",
+                "competition_score": 7, "recent_density_score": 7,
+                "combined_score": 15, "source": "blog(실패)"}
+
+    # ── 2) 최근 N일 발행 밀도 ──
+    # Naver Blog Search 의 date 정렬 — 최근 100건 받아서 N일 이내 카운트.
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_window_days)
+    recent_count = 0
+    try:
+        r2 = requests.get("https://openapi.naver.com/v1/search/blog.json",
+                            headers=headers,
+                            params={"query": keyword, "display": 100, "sort": "date"},
+                            timeout=10)
+        if r2.status_code == 200:
+            items = r2.json().get("items", []) or []
+            for it in items:
+                pd = it.get("postdate", "") or ""
+                # postdate 형식: YYYYMMDD
+                if len(pd) == 8 and pd.isdigit():
+                    try:
+                        dt = datetime(int(pd[:4]), int(pd[4:6]), int(pd[6:8]),
+                                       tzinfo=timezone.utc)
+                        if dt >= cutoff:
+                            recent_count += 1
+                    except Exception:
+                        continue
+    except Exception as e:
+        log.warning("[naver_golden] Blog recent 실패: %s", e)
+        recent_count = None
+
+    # 0~15 점수 — 최근 발행 수가 적을수록 좋음 (블루오션)
+    if recent_count is None:
+        recent_score = 7   # 데이터없음 — 중립
+    elif recent_count == 0:    recent_score = 15
+    elif recent_count <= 3:    recent_score = 12
+    elif recent_count <= 10:   recent_score = 8
+    elif recent_count <= 30:   recent_score = 4
+    else:                      recent_score = 0
+
+    combined = total_score + recent_score
+    return {
+        "total_results": total,
+        "recent_count": recent_count,
+        "competition_label": label,
+        "competition_score": total_score,        # 0~15
+        "recent_density_score": recent_score,    # 0~15
+        "combined_score": combined,              # 0~30
+        "source": "naver_blog",
+    }
 
 
 def _fetch_trends(keyword, enabled=True):
@@ -136,6 +245,7 @@ def _score(keyword, dl, blog, gt, weights):
     dl_raw = dl.get("trend_score", 0)
     dl_dir = dl.get("trend_direction", "")
     dl_src = dl.get("source", "")
+    dl_slope = float(dl.get("trend_slope_pct", 0.0) or 0.0)
     if "스킵" in dl_src or "실패" in dl_src or "데이터없음" in dl_dir:
         dl_score = int(w_dl * 0.38)
     else:
@@ -144,20 +254,35 @@ def _score(keyword, dl, blog, gt, weights):
         elif dl_raw >= 30: base = 18
         elif dl_raw >= 10: base = 10
         else: base = 4
-        adj = 5 if "상승" in dl_dir else (-5 if "하락" in dl_dir else 0)
-        raw = max(0, min(40, base + adj))
+        # score-2: slope 정량화 — 라벨이 아니라 수치 기반 보정 (-7..+7)
+        slope_adj = max(-7.0, min(7.0, dl_slope / 10.0))
+        raw = max(0, min(40, base + slope_adj))
         dl_score = max(0, min(w_dl, round(raw * w_dl / 40)))
 
-    raw_bl = blog.get("competition_score", 15)
+    # v13: 총량(0~15) + 최근 14일 밀도(0~15) = combined(0~30)
+    raw_bl = blog.get("combined_score", blog.get("competition_score", 15))
     if blog.get("total_results") is None:
         bl_score = int(w_bl * 0.50)
     else:
         bl_score = max(0, min(w_bl, round(raw_bl * w_bl / 30)))
 
+    # score-5: 텍스트 매칭 + Shopping API 카운트 하이브리드
     hits = [w for w in COMMERCIAL_WORDS if w in keyword]
-    if len(hits) >= 2: com_score = w_co
-    elif len(hits) == 1: com_score = round(w_co * 0.75)
-    else: com_score = round(w_co * 0.20)
+    if len(hits) >= 2: com_base = w_co
+    elif len(hits) == 1: com_base = round(w_co * 0.75)
+    else: com_base = round(w_co * 0.20)
+
+    # Shopping API total — None 이면 텍스트 매칭만 사용
+    shop_total = dl.get("shopping_total") if isinstance(dl, dict) else None
+    if shop_total is not None:
+        if shop_total >= 50_000:    shop_adj = round(w_co * 0.20)
+        elif shop_total >= 5_000:   shop_adj = round(w_co * 0.10)
+        elif shop_total >= 500:     shop_adj = round(w_co * 0.05)
+        elif shop_total > 0:        shop_adj = 0
+        else:                       shop_adj = -round(w_co * 0.20)
+        com_score = max(0, min(w_co, com_base + shop_adj))
+    else:
+        com_score = com_base
 
     gt_raw = gt.get("trend_score", 0)
     gt_dir = gt.get("trend_direction", "")
@@ -189,7 +314,11 @@ def _to_evaluation(keyword, dl, blog, gt, scored, profile):
         comp_kr = "중간"
     else:
         comp_kr = "높음"
-    sv_estimate = int(round(float(dl.get("trend_score", 0) or 0) * 300))
+    # search_volume: Search Ad API 절대값이 있으면 우선, 없으면 DataLab 추정치
+    if dl.get("abs_monthly_qc") is not None:
+        sv_estimate = int(dl["abs_monthly_qc"])
+    else:
+        sv_estimate = int(round(float(dl.get("trend_score", 0) or 0) * 300))
     n_hits = len(scored.get("commercial_hits", []))
     commercial_intent = min(1.0, 0.2 + n_hits * 0.20)
     return Evaluation(
@@ -201,6 +330,13 @@ def _to_evaluation(keyword, dl, blog, gt, scored, profile):
             "components": {
                 "datalab": scored["dl_score"], "blog": scored["bl_score"],
                 "commercial": scored["com_score"], "gtrends": scored["gt_score"],
+            },
+            # score-1: blog sub-axis 가시화
+            "blog_subaxes": {
+                "total_score":         blog.get("competition_score"),
+                "recent_density_score": blog.get("recent_density_score"),
+                "recent_count":         blog.get("recent_count"),
+                "window_days":          blog.get("window_days", 14),
             },
             "weights": scored["weights"], "commercial_hits": scored.get("commercial_hits", []),
         },
@@ -243,7 +379,23 @@ class NaverGoldenEvaluator(BaseEvaluator):
             return ev
         dl = _fetch_datalab(kw, self.datalab_id, self.datalab_secret)
         if self.delay: time.sleep(self.delay)
-        blog = _fetch_blog(kw, self.naver_id, self.naver_secret)
+        # score-3: Search Ad API 절대 월 검색량 (있으면 dl.trend_score 와 병행 기록)
+        try:
+            from .naver_search_ad import monthly_search_volume
+            abs_vol = monthly_search_volume(kw)
+        except Exception:
+            abs_vol = None
+        if abs_vol is not None:
+            dl["abs_monthly_qc"] = abs_vol
+            dl["source"] = (dl.get("source") or "") + "+searchad"
+        # score-5: Shopping API total — 상업적 의도 보강
+        shop_total = _fetch_shopping_signal(kw, self.naver_id, self.naver_secret)
+        if shop_total is not None:
+            dl["shopping_total"] = shop_total
+        # score-1: 최근 N일 발행 밀도 window 는 config 에서 (default 14)
+        recent_days = getattr(self, "recent_density_window_days", 14)
+        blog = _fetch_blog(kw, self.naver_id, self.naver_secret,
+                            recent_window_days=recent_days)
         if self.delay: time.sleep(self.delay)
         gt_enabled = self.enable_trends and self._gt_call_count < 5
         gt = _fetch_trends(kw, enabled=gt_enabled)

@@ -2276,6 +2276,89 @@ def test_publisher_blocks_daily_limit():
     s.close()
 
 
+def test_score6_diversity_warning_when_too_many_similar():
+    """score-6: 최근 N편 중 cosine ≥ 0.8 그룹이 max_in_group 이상이면 발행 차단."""
+    import json
+    from datetime import timedelta
+    from osmu_kr.models import (
+        ContentRecord, KeywordUsage, USAGE_PUBLISHED, now_utc, to_iso,
+    )
+    from osmu_kr.publisher import MockPublisher, Publisher
+
+    s = _publish_setup_sqlite()
+    # 동일 임베딩(거의 1.0 cosine) 5편 published
+    same_emb = [0.01] * 768
+    today = now_utc()
+    for i in range(5):
+        s.append_content(ContentRecord(
+            id=f"sim-{i}", keyword=f"k{i}", refined_post="<p>x</p>",
+            status="발행완료",
+            created_at=to_iso(today - timedelta(days=2 + i)),
+            summary_embedding_json=json.dumps(same_emb),
+        ))
+        s.upsert_usage(KeywordUsage(
+            id=f"u-sim-{i}", keyword_id=f"kw-{i}", contents_id=f"sim-{i}",
+            blog_id="myblog", status=USAGE_PUBLISHED,
+            started_at=to_iso(today - timedelta(days=2 + i)),
+            published_at=to_iso(today - timedelta(days=1 + i)),
+        ))
+    # 후보 — 거의 같은 임베딩 + 게이트 통과 위해 충분히 오래된 draft
+    s.append_content(ContentRecord(
+        id="cand-1", keyword="cand", refined_post="<p>candidate</p>",
+        status="승인완료",
+        created_at=to_iso(today - timedelta(hours=2)),
+        summary_embedding_json=json.dumps(same_emb),
+    ))
+    # publisher.max_retries=1 (테스트 빠르게)
+    cm_pre = None
+    pub = Publisher(s, backend=MockPublisher())
+    pub.config_mgr.set("publisher.max_retries", 1)
+    res = pub.publish("cand-1", skip_gates=False)
+    # 유사도 cooldown 도 동시 위반이라 어느 게이트에 막혀도 OK
+    assert not res.success
+    assert res.blocked_reason
+    assert ("diversity_warning" in res.blocked_reason
+             or "similarity_cooldown" in res.blocked_reason)
+    s.close()
+
+
+def test_score7_publish_retry_increments_attempt_count():
+    """score-7: 백엔드 실패 시 자동 재시도 + publish_attempt_count 증가."""
+    from datetime import timedelta
+    from osmu_kr.models import ContentRecord, now_utc, to_iso
+    from osmu_kr.publisher import BasePublisher, Publisher, PublishResult
+
+    class FlakeBackend(BasePublisher):
+        name = "flake"
+        def __init__(self):
+            self.calls = 0
+        def publish(self, *, title, html, account, contents_id=""):
+            self.calls += 1
+            if self.calls < 3:
+                return PublishResult(success=False, error="transient_error")
+            return PublishResult(success=True,
+                                  platform_url="https://x.tistory.com/1",
+                                  published_at=to_iso(now_utc()))
+
+    s = _publish_setup_sqlite()
+    s.append_content(ContentRecord(
+        id="r-1", keyword="x", refined_post="<h1>x</h1>",
+        created_at=to_iso(now_utc() - timedelta(hours=2)),
+    ))
+    backend = FlakeBackend()
+    pub = Publisher(s, backend=backend)
+    # 빠른 테스트 — 백오프 0
+    pub.config_mgr.set("publisher.retry_backoff_seconds", 0)
+    pub.config_mgr.set("publisher.max_retries", 3)
+    res = pub.publish("r-1")
+    assert res.success
+    assert backend.calls == 3
+    # publish_attempt_count = 3
+    rec = next(r for r in s.list_content() if r.id == "r-1")
+    assert rec.publish_attempt_count == 3
+    s.close()
+
+
 def test_publisher_tistory_blocked_without_real_env():
     """OSMU_PUBLISH_REAL 가 없으면 TistoryPlaywrightPublisher 가 드라이런 메시지."""
     import os
@@ -2292,6 +2375,9 @@ def test_publisher_tistory_blocked_without_real_env():
     ))
     try:
         pub = Publisher(s, backend=TistoryPlaywrightPublisher())
+        # score-7 도입 — 테스트 빠르게 끝나도록 retries=1 + backoff=0
+        pub.config_mgr.set("publisher.max_retries", 1)
+        pub.config_mgr.set("publisher.retry_backoff_seconds", 0)
         res = pub.publish("c-t")
         assert not res.success
         assert "OSMU_PUBLISH_REAL" in res.error
@@ -3181,6 +3267,8 @@ TESTS = [
     test_publisher_blocks_when_draft_too_fresh,
     test_publisher_blocks_daily_limit,
     test_publisher_tistory_blocked_without_real_env,
+    test_score6_diversity_warning_when_too_many_similar,
+    test_score7_publish_retry_increments_attempt_count,
     test_checker_passes_well_formed_html,
     test_checker_flags_short_html_and_missing_alt,
     test_checker_keywords_present_check_with_blueprint,

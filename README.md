@@ -328,7 +328,7 @@ osmu-kr delete-content --id 042
 
 ```bash
 OSMU_EMBEDDER=stub PYTHONPATH=src python tests/test_basic.py
-# result: 116/116 passed
+# result: 118/118 passed
 ```
 
 GitHub Actions(`tests.yml`)는 push/PR마다 Python 3.10/3.11/3.12 + macOS-latest 매트릭스로 자동 실행. 테스트 환경에서는 `OSMU_EMBEDDER=stub` 강제로 ko-sroberta 다운로드를 회피.
@@ -385,6 +385,20 @@ GitHub Actions(`tests.yml`)는 push/PR마다 Python 3.10/3.11/3.12 + macOS-lates
 - [x] CLI — `check-content`, `approve`, `reject`, `publish` 명령
 - [x] Streamlit 검토 UI — `ui/pages/7_검토_승인.py`
 - [x] keyword_usages timeout 자동 처리 — housekeeping 안에서 24h 초과 자동 failed
+- [x] 점수 정확도 보완 (score-1 ~ score-7)
+  - blog 경쟁도 sub-axis 분리 (총량 15 + 최근 14일 밀도 15)
+  - DataLab slope 정량화 (% 기반)
+  - Naver Search Ad API `monthlyPcQcCnt` 절대 월 검색량 (정확도 ⭐⭐⭐)
+  - Naver Search Ad API `keywordstool` 연관 키워드 (자동완성 대체/보완)
+  - Shopping API + 패턴 룰 하이브리드 (상업적 의도 정확도 ⭐⭐)
+  - 다양성 회피 (v13 spec d): 최근 7일 5편 중 cosine ≥ 0.8 그룹 3편 이상 경고
+  - publish_attempt_count 재시도 + 지수 백오프
+- [x] CI/CD — GitHub Actions 에 실 Neon 통합 테스트 job 추가
+- [x] Codespaces prebuild — sentence-transformers 모델 캐시 (다운로드 회피)
+- [x] 비용/한도 모니터링 — `monitoring.py` 호출 카운터 + Slack 임계 알림
+- [x] DB 백업 — `scripts/backup_db.py` (SQLite .backup API / pg_dump)
+- [x] Anthropic 모델 선택 config 화 — `anthropic.model.{interpret,blueprint,writer}`
+- [x] **문서화** — 외부 서비스 셋업 v2 PDF + 운영자 매뉴얼 v2 PDF + 개발자 가이드 MD
 - [ ] **운영 진입** — 실 Tistory DOM 셀렉터 확정 (쿠키 캡처 후 첫 발행하면서)
 - [ ] checker — 자기잠식·표절·구조 두 단계 게이트
 - [ ] publisher — 티스토리 Playwright + 어뷰징 게이트

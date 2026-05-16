@@ -366,6 +366,61 @@ class Publisher:
                 return f"similarity_cooldown:sim={sim:.3f}>={thr} (vs {other.id})"
         return None
 
+    # ── score-6: 다양성 회피 (v13 spec d) ──────────────
+    def _check_diversity(self, record: ContentRecord, account) -> Optional[str]:
+        """최근 N일 N편 중 cosine ≥ threshold 그룹이 max_in_group 이상이면 경고.
+
+        v13 spec 의 "(d) 다양성 (UX)" — 사람이 본 채널이 비슷한 글로만 도배되는 것 방지.
+        """
+        window_days = self.config_mgr.get_int("publisher.diversity_window_days", 7)
+        group_size = self.config_mgr.get_int("publisher.diversity_group_size", 5)
+        threshold = self.config_mgr.get_float("publisher.diversity_similarity", 0.8)
+        max_in_group = self.config_mgr.get_int("publisher.diversity_max_in_group", 3)
+        if window_days <= 0 or group_size <= 0:
+            return None
+        if not record.summary_embedding_json:
+            return None
+
+        try:
+            import json
+            from .content_generator.embedder import cosine
+            my_vec = json.loads(record.summary_embedding_json)
+        except Exception:
+            return None
+
+        cutoff = now_utc() - timedelta(days=window_days)
+        recent_kids = []
+        for u in self.storage.list_usages():
+            if u.status != USAGE_PUBLISHED or not u.published_at:
+                continue
+            if account and u.blog_id and u.blog_id != account.blog_id:
+                continue
+            try:
+                pub_dt = from_iso(u.published_at)
+            except Exception:
+                continue
+            if pub_dt >= cutoff:
+                recent_kids.append(u.contents_id)
+        if len(recent_kids) < group_size:
+            return None
+        # 최근 group_size 편만 검사
+        recent_kids = recent_kids[-group_size:]
+        cnt = 0
+        for other in self.storage.list_content():
+            if other.id not in recent_kids:
+                continue
+            if not other.summary_embedding_json:
+                continue
+            try:
+                ovec = json.loads(other.summary_embedding_json)
+            except Exception:
+                continue
+            if cosine(my_vec, ovec) >= threshold:
+                cnt += 1
+        if cnt >= max_in_group:
+            return f"diversity_warning:{cnt}/{len(recent_kids)} (>={threshold} 유사)"
+        return None
+
     # ── 공개 API ──────────────────────────────────────
     def publish(self, content_id: str, *,
                   account=None, skip_gates: bool = False) -> PublishResult:
@@ -389,18 +444,38 @@ class Publisher:
                 ("daily_limit", lambda: self._check_daily_limit(account)),
                 ("min_draft", lambda: self._check_min_draft_age(record)),
                 ("similarity", lambda: self._check_similarity_cooldown(record, account)),
+                ("diversity", lambda: self._check_diversity(record, account)),
             ):
                 blocked = fn()
                 if blocked:
                     log.warning("[publisher] %s 차단: %s", gate, blocked)
                     return PublishResult(success=False, blocked_reason=blocked)
 
-        # 발행
+        # score-7: 재시도 + 지수 백오프
         title = record.title or record.title_final or record.keyword
-        result = self.backend.publish(
-            title=title, html=record.refined_post,
-            account=account, contents_id=record.id,
-        )
+        max_retries = self.config_mgr.get_int("publisher.max_retries", 3)
+        backoff = self.config_mgr.get_float("publisher.retry_backoff_seconds", 30.0)
+        result = PublishResult(success=False, error="not_attempted")
+        prev_attempts = int(record.publish_attempt_count or 0)
+        import time as _time
+        for attempt in range(1, max(1, max_retries) + 1):
+            result = self.backend.publish(
+                title=title, html=record.refined_post,
+                account=account, contents_id=record.id,
+            )
+            self.storage.update_content(
+                record.id, publish_attempt_count=prev_attempts + attempt,
+            )
+            if result.success:
+                break
+            if attempt < max_retries:
+                wait = backoff * (2 ** (attempt - 1))
+                log.warning("[publisher] %d/%d 실패 — %.0fs 대기 후 재시도: %s",
+                              attempt, max_retries, wait, result.error)
+                try:
+                    _time.sleep(min(wait, 300))   # 안전 상한 5분
+                except Exception:
+                    pass
 
         # contents + keyword_usages 갱신
         if result.success:

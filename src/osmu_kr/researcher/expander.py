@@ -54,10 +54,32 @@ def _dedup_with_normalize(candidates):
     return out
 
 
-def expand(seed: str, limit: int = 10, *, use_autocomplete: bool = True) -> List[str]:
+def fetch_searchad_related(seed: str, limit: int = 30) -> List[str]:
+    """score-4: Naver Search Ad API keywordstool 의 연관 키워드. 정확도 ⭐⭐⭐.
+
+    키 없거나 호출 실패 시 빈 리스트.
+    """
+    try:
+        from ..evaluator.naver_search_ad import related_keywords
+        return related_keywords(seed, limit=limit) or []
+    except Exception as e:
+        log.warning("[expander] searchad related 실패: %s", e)
+        return []
+
+
+def expand(seed: str, limit: int = 10, *,
+            use_autocomplete: bool = True,
+            use_searchad: bool = True) -> List[str]:
+    """씨드 → 후보 키워드.
+
+    score-4 우선순위: searchad keywordstool > 자동완성 > 접미어 룰.
+    """
     s = (seed or "").strip()
     if not s:
         return []
+    searchad = fetch_searchad_related(s, limit=30) if use_searchad else []
     autocomplete = fetch_naver_autocomplete(s, limit=10) if use_autocomplete else []
     suffix_keywords = [f"{s} {sfx}" for sfx in EXPANSION_SUFFIXES]
-    return _dedup_with_normalize([s] + autocomplete + suffix_keywords)[:limit]
+    return _dedup_with_normalize(
+        [s] + searchad + autocomplete + suffix_keywords
+    )[:limit]

@@ -248,11 +248,16 @@ class AnthropicWriter(BaseWriter):
     name = "anthropic"
 
     def __init__(self, api_key: Optional[str] = None,
-                 *, model: str = "claude-sonnet-4-5",
+                 *, model: Optional[str] = None,
                  max_tokens: int = 4096, temperature: float = 0.7,
                  timeout: int = 60):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        self.model = model
+        # infra-5: env / config 우선, 없으면 코드 default
+        self.model = (
+            model
+            or os.environ.get("OSMU_ANTHROPIC_MODEL_WRITER")
+            or "claude-sonnet-4-6"
+        )
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout

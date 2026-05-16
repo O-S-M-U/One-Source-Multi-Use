@@ -161,10 +161,18 @@ def _normalize_llm_fields(obj: dict) -> dict:
 
 
 # ── 공개 API ────────────────────────────────────────────
+def _resolve_model_default() -> str:
+    """infra-5: env 또는 코드 default 모델명."""
+    return os.environ.get(
+        "OSMU_ANTHROPIC_MODEL_INTERPRET",
+        "claude-haiku-4-5-20251001",
+    )
+
+
 def interpret(value: Union[str, KeywordContext, None],
               *, use_llm: Optional[bool] = None,
               api_key: Optional[str] = None,
-              model: str = "claude-haiku-4-5-20251001") -> KeywordContext:
+              model: Optional[str] = None) -> KeywordContext:
     """0단계 — keyword → KeywordContext 정규화 (룰 + 옵션 LLM).
 
     Args:
@@ -202,6 +210,7 @@ def interpret(value: Union[str, KeywordContext, None],
         return replace(base, source="llm_fallback_rule",
                         raw_signals={**base.raw_signals, "llm_skip": "no_api_key"})
 
+    model = model or _resolve_model_default()
     user_prompt = f"키워드: {base.keyword}"
     last_err: Optional[Exception] = None
     for attempt in (1, 2):

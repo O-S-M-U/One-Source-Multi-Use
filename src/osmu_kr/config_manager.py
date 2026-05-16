@@ -54,6 +54,18 @@ DEFAULTS: Dict[str, Any] = {
     "publisher.similarity_cooldown_days":     3,
     # housekeeping.*
     "housekeeping.inprogress_timeout_hours":  24,    # ops-5: in_progress lock 자동 해제
+    # publisher 다양성 회피 (score-6 / v13 spec d)
+    "publisher.diversity_window_days":        7,
+    "publisher.diversity_group_size":         5,    # 최근 N편 검사
+    "publisher.diversity_similarity":         0.8,  # cosine 임계
+    "publisher.diversity_max_in_group":       3,    # 동일 그룹 N편 이상이면 경고
+    # publisher 재시도 (score-7)
+    "publisher.max_retries":                  3,
+    "publisher.retry_backoff_seconds":        30,
+    # Anthropic 모델 선택 (infra-5) — 코드 수정 없이 모델 전환
+    "anthropic.model.interpret":              "claude-haiku-4-5-20251001",
+    "anthropic.model.blueprint":              "claude-sonnet-4-6",
+    "anthropic.model.writer":                 "claude-sonnet-4-6",
 }
 
 # ── legacy 환경변수 호환 — 기존 이름이 환경에 박혀있어도 인식 ─────

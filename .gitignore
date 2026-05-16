@@ -25,6 +25,15 @@ cookies/
 *.db-wal
 *.db-shm
 
+# 개인 운영 메모 — MY_* / my_* 접두사만 (대소문자 모두)
+# 예) MY_SETUP.md, MY_NOTES.md, my_keys.md
+MY_*.md
+my_*.md
+
+# DB 백업 산출물
+backups/
+backups.log
+
 data/
 *.csv
 !demos/**/*.csv
