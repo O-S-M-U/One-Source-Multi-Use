@@ -178,18 +178,18 @@ commercial_elements  — { recommendations, comparison_points, cta_candidates }
 
 ---
 
-## 💾 저장 모드 6종
+## 💾 저장 모드
 
-| 모드 | 동작 | 권장 상황 |
+| 모드 | 동작 | 사용처 |
 |---|---|---|
-| `local` | 내 컴퓨터(.xlsx 또는 .csv) 단독 | 혼자 사용, 오프라인 |
-| `sheets` | Google Sheets 단독 (실시간 호출) | 팀 협업 우선 |
-| `mirror` | 로컬 + Sheets 양방향 동기화 | 단독·팀 둘 다 |
-| `sqlite` | 단일 .db 파일 — v9 spec 5개 테이블 | 개발·단독 운영 |
-| `postgres` 🆕 | PostgreSQL + pgvector — Neon 등 | **운영 권장** — pgvector 의미 검색 |
-| `auto` | 자격증명 있으면 mirror, 없으면 local | 별 설정 없이 |
+| `postgres` ⭐ | PostgreSQL + pgvector (Neon 등) | **운영 default** — `OSMU_DATABASE_URL` 만 채우면 자동 |
+| `auto` | DATABASE_URL 있으면 postgres, 없으면 mirror/local 폴백 | 기본값 |
+| `mirror` | Local + Google Sheets 양방향 동기화 | 팀 협업 |
+| `sheets` | Google Sheets 단독 | 팀 협업 (가벼움) |
+| `local` | xlsx 또는 csv 단독 | 임시 폴백 |
+| `sqlite` | 단일 `.db` 파일 | 회귀 테스트 / 로컬 디버깅 전용 (운영 비권장) |
 
-5개 테이블(`keywords / keyword_evaluations / keyword_usages / accounts / contents`)이 첫 호출 시 자동 생성된다. SQLite·PostgreSQL 모두 같은 `BaseStorage` 인터페이스 — 코드 변경 없이 백엔드 전환 가능.
+5개 테이블(`keywords / keyword_evaluations / keyword_usages / accounts / contents`) + `config` 가 첫 호출 시 자동 생성된다. 모든 백엔드가 같은 `BaseStorage` 인터페이스 — 코드 변경 없이 전환 가능.
 
 ### Neon (PostgreSQL + pgvector) 셋업 5분 가이드
 
@@ -216,12 +216,11 @@ commercial_elements  — { recommendations, comparison_points, cta_candidates }
 
 | 변수 | 기본값 | 의미 |
 |---|---|---|
-| `OSMU_STORAGE_BACKEND` | `auto` | `auto` / `mirror` / `sheets` / `local` / `sqlite` / `postgres` |
-| `OSMU_LOCAL_FORMAT` | `xlsx` | `xlsx` / `csv` |
-| `OSMU_SQLITE_PATH` | `./osmu.db` | SQLite 파일 경로 (`backend=sqlite` 일 때) |
-| `OSMU_DATABASE_URL` | — | PostgreSQL 연결 문자열 (`backend=postgres` 일 때, Neon 등) |
+| `OSMU_STORAGE_BACKEND` | `auto` | `auto` / `postgres` / `mirror` / `sheets` / `local` (sqlite 는 테스트 전용) |
+| `OSMU_DATABASE_URL` | — | **운영 필수** — PostgreSQL 연결 문자열 (Neon 등) |
 | `OSMU_DB_POOL_MIN` | `1` | psycopg 풀 최소 커넥션 |
 | `OSMU_DB_POOL_MAX` | `4` | psycopg 풀 최대 커넥션 |
+| `OSMU_LOCAL_FORMAT` | `xlsx` | `xlsx` / `csv` — local 폴백 시 |
 | `OSMU_EVALUATOR` | `heuristic` | `heuristic` / `naver_golden` / `naver_ads` |
 | `OSMU_POOL_MAX_SIZE` | `200` | 풀 최대 크기 |
 | `OSMU_REVIVAL_DAYS` | `30` | 재평가 주기(일) |

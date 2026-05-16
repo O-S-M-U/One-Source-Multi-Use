@@ -122,22 +122,28 @@ def main(argv=None) -> int:
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 운영 default = postgres. DATABASE_URL 있으면 무조건 그쪽 우선.
     backend = os.environ.get("OSMU_STORAGE_BACKEND", "").strip().lower()
-    if not backend:
-        backend = "sqlite" if os.path.isfile("./osmu.db") else "local"
+    db_url = os.environ.get("OSMU_DATABASE_URL", "")
+    if not backend or backend == "auto":
+        backend = "postgres" if db_url else "local"
     log.info("backup 시작 — backend=%s out=%s", backend, out_dir)
 
     errors: list = []
     try:
-        if backend == "sqlite":
+        if backend == "postgres":
+            if not db_url:
+                raise RuntimeError(
+                    "OSMU_DATABASE_URL 가 비어 있음 — Neon 등 PostgreSQL 연결 문자열 필요"
+                )
+            backup_postgres(db_url, out_dir)
+        elif backend == "sqlite":
+            # 명시적으로 sqlite 백엔드 지정한 경우 (테스트/로컬 디버깅)
             db_path = os.environ.get("OSMU_SQLITE_PATH", "./osmu.db")
             backup_sqlite(db_path, out_dir)
-        elif backend == "postgres":
-            url = os.environ.get("OSMU_DATABASE_URL", "")
-            if not url:
-                raise RuntimeError("OSMU_DATABASE_URL 가 비어 있음")
-            backup_postgres(url, out_dir)
-        # 어떤 백엔드든 로컬 파일도 백업
+        else:
+            log.info("backend=%s — DB 백업 건너뜀. 로컬 파일만 복사.", backend)
+        # 어떤 백엔드든 로컬 파일도 백업 (xlsx/csv 가 있다면)
         backup_local_files(os.environ.get("OSMU_LOCAL_DATA_DIR", "./data"), out_dir)
     except Exception as e:
         log.error("backup 실패: %s", e)

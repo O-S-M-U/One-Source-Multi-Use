@@ -63,12 +63,26 @@ def _build_postgres(cfg: Config) -> BaseStorage:
 
 
 def build_storage(cfg: Config) -> BaseStorage:
+    """v13 운영 default — PostgreSQL.
+
+    우선순위:
+      1) backend 가 명시적으로 지정됐으면 그대로
+      2) backend='auto' + DATABASE_URL 있음        → postgres
+      3) backend='auto' + Google Sheets 자격 있음   → mirror
+      4) backend='auto' + 둘 다 없음                → local (개발·테스트 폴백)
+    """
     backend = cfg.resolved_backend()
 
     if backend == "auto":
-        backend = "mirror" if (cfg.has_google_credentials and cfg.sheet_id) else "local"
+        if getattr(cfg, "database_url", None):
+            backend = "postgres"
+        elif cfg.has_google_credentials and cfg.sheet_id:
+            backend = "mirror"
+        else:
+            backend = "local"
 
     if backend == "sqlite":
+        # 명시적 sqlite — 테스트/개발 전용
         return _build_sqlite(cfg)
 
     if backend == "postgres":
