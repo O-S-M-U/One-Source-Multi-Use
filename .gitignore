@@ -25,8 +25,11 @@ cookies/
 *.db-wal
 *.db-shm
 
-# 개인 운영 메모 — MY_* / my_* 접두사만 (대소문자 모두)
-# 예) MY_SETUP.md, MY_NOTES.md, my_keys.md
+# 개인 운영 메모 — MY_* / my_* 접두사 (대소문자 모두)
+# 현재 커버되는 파일 (모두 untracked):
+#   MY_SETUP.md     — 셋업 체크리스트
+#   MY_RUNBOOK.md   — 실행 명령어 모음
+#   my_notes.md / my_keys.md 등 본인 추가 메모도 자동
 MY_*.md
 my_*.md
 

@@ -47,41 +47,168 @@ from .keyword_context import KeywordContext
 log = logging.getLogger(__name__)
 
 
-# ── 데이터 구조 ─────────────────────────────────────────
+# ── v13 enum ──────────────────────────────────────────
+KNOWLEDGE_LEVELS = ("beginner", "intermediate", "expert")
+# v13 spec: primary_intent 는 3종 (정보탐색/구매결정/문제해결).
+# 키워드 의도(공략·추천·비교·…)는 별도 KeywordContext.intent_hint 에만 남고
+# 청사진의 target_reader 가 사용하는 ‘행동 의도’는 이 3종으로만 한정.
+PRIMARY_INTENTS = ("정보탐색", "구매결정", "문제해결")
+OVERALL_TONES = ("정보형", "후기형", "비교형")
+ENDING_TYPES = ("summary", "cta", "recommendation")
+PARAGRAPH_TYPES = ("llm_generated", "fact_based")
+FACT_TYPES = ("statistic", "claim", "fact", "definition")
+
+
+# ── 데이터 구조 (v13 spec 정확히 정렬) ────────────────
 @dataclass
 class TargetReader:
-    """이 글의 타깃 독자.
+    """v13 spec — 타깃 독자.
 
-    persona         : 한 문장 페르소나 (예: ‘처음 데드바이데이라이트를 시작하는 직장인 게이머’)
-    knowledge_level : 초보 | 중급 | 전문가
-    primary_intent  : 공략 | 추천 | 비교 | 리뷰 | 구매 | 방법 | 순위 | 팁 | 정보
+    persona         : 한 문장 페르소나
+    knowledge_level : beginner | intermediate | expert
+    primary_intent  : 정보탐색 | 구매결정 | 문제해결
     """
     persona: str
-    knowledge_level: str
-    primary_intent: str
+    knowledge_level: str = "beginner"
+    primary_intent: str = "정보탐색"
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 @dataclass
-class ParagraphBlock:
-    """blueprint 의 한 단락 (= 결국 글의 H2 섹션).
-
-    section_index   : 1부터 시작
-    title           : H2 제목 (실제 본문에 쓰임)
-    paragraph_type  : 'fact_based' | 'llm_generated'
-    description     : 이 단락에서 무엇을 다뤄야 하는지 짧은 설명
-    facts_required  : fact_based 일 때만 — 어떤 사실/수치를 가져와야 하는지 키워드 리스트
-    """
-    section_index: int
-    title: str
-    paragraph_type: str
-    description: str
-    facts_required: List[str] = field(default_factory=list)
+class Ending:
+    """v13 spec — 글 끝맺음 방향."""
+    type: str = "summary"          # summary | cta | recommendation
+    direction: str = ""             # 마무리에서 유도할 행동/추천 방향
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class Fact:
+    """v13 spec — fact_based 단락에 들어가는 정규화 fact 한 건."""
+    type: str = "fact"              # statistic | claim | fact | definition
+    content: str = ""
+    entity: str = ""                # 출처 기관/사람
+    year: Optional[int] = None
+    source_url: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class ParagraphBlock:
+    """v13 spec — body_paragraphs[*].
+
+    paragraph_id              : "p1", "p2", ...
+    type                      : llm_generated | fact_based
+    h2_subtitle               : H2 제목
+    core_message              : 이 단락이 다룰 핵심 주장/주제
+    assigned_keywords         : LLM 이 단락 주제 분석으로 도출한 서브 키워드 (SEO)
+    image_search_keywords_en  : 이미지 검색 영문 키워드
+    image_alt_text_ko         : 한국어 alt text 초안
+    facts                     : fact_based 일 때만. Phase 2 에서 채워짐
+    """
+
+    __slots__ = (
+        "paragraph_id", "type", "h2_subtitle", "core_message",
+        "assigned_keywords", "image_search_keywords_en",
+        "image_alt_text_ko", "facts",
+    )
+
+    def __init__(self, paragraph_id=None, type=None, h2_subtitle=None,
+                  core_message="", assigned_keywords=None,
+                  image_search_keywords_en=None, image_alt_text_ko="",
+                  facts=None,
+                  # ── legacy kwargs (후방호환) ──
+                  section_index=None, title=None,
+                  paragraph_type=None, description=None,
+                  facts_required=None,
+                  # positional 처리 — 첫 두 개는 v13 인자 (paragraph_id, type)
+                  # 또는 legacy (section_index 정수, "fact_based" 등) 둘 다 가능
+                  ):
+        # paragraph_id 결정
+        if paragraph_id is None and section_index is not None:
+            paragraph_id = f"p{int(section_index)}"
+        if paragraph_id is None:
+            paragraph_id = "p1"
+        self.paragraph_id = str(paragraph_id)
+
+        # type 결정
+        if type is None and paragraph_type is not None:
+            type = paragraph_type
+        self.type = type or "fact_based"
+
+        # h2_subtitle 결정
+        if h2_subtitle is None and title is not None:
+            h2_subtitle = title
+        self.h2_subtitle = h2_subtitle or ""
+
+        # core_message 결정
+        if not core_message and description:
+            core_message = description
+        self.core_message = core_message or ""
+
+        # assigned_keywords 결정
+        if assigned_keywords is None and facts_required is not None:
+            assigned_keywords = facts_required
+        self.assigned_keywords = list(assigned_keywords or [])
+        self.image_search_keywords_en = list(image_search_keywords_en or [])
+        self.image_alt_text_ko = image_alt_text_ko or ""
+        self.facts = list(facts or [])
+
+    def to_dict(self) -> dict:
+        d = {
+            "paragraph_id": self.paragraph_id,
+            "type": self.type,
+            "h2_subtitle": self.h2_subtitle,
+            "core_message": self.core_message,
+            "assigned_keywords": list(self.assigned_keywords),
+            "image_search_keywords_en": list(self.image_search_keywords_en),
+            "image_alt_text_ko": self.image_alt_text_ko,
+        }
+        # fact_based 일 때만 facts 포함
+        if self.type == "fact_based":
+            d["facts"] = [f.to_dict() if hasattr(f, "to_dict") else f
+                            for f in self.facts]
+        return d
+
+    def __repr__(self) -> str:
+        return (
+            f"ParagraphBlock(id={self.paragraph_id!r}, type={self.type!r}, "
+            f"h2={self.h2_subtitle!r})"
+        )
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, ParagraphBlock):
+            return NotImplemented
+        return all(getattr(self, k) == getattr(other, k) for k in self.__slots__)
+
+    # ── 후방호환 alias (읽기 전용) ──
+    @property
+    def section_index(self) -> int:
+        try:
+            return int(str(self.paragraph_id).lstrip("pP"))
+        except ValueError:
+            return 0
+
+    @property
+    def title(self) -> str:
+        return self.h2_subtitle
+
+    @property
+    def paragraph_type(self) -> str:
+        return self.type
+
+    @property
+    def description(self) -> str:
+        return self.core_message
+
+    @property
+    def facts_required(self) -> List[str]:
+        return list(self.assigned_keywords)
 
 
 @dataclass
@@ -105,17 +232,20 @@ class CommercialElements:
 
 @dataclass
 class BlueprintResult:
-    """collector Phase 1 산출물 묶음 (4종 + commercial + 메타).
+    """v13 spec — collector Phase 1 산출물.
 
-    summary_embedding 은 별도 단계에서 채워진다 — 여기선 None.
-    commercial_elements 는 같은 LLM 호출에서 함께 생성 (4단계 신규).
+    spec 정렬: title / intro / short_conclusion / target_reader / overall_tone /
+              ending / body_paragraphs (= paragraphs).
+    OSMU 추가: summary_embedding / commercial_elements / source / raw_signals.
     """
     keyword: str
     title: str
     target_reader: TargetReader
-    paragraphs: List[ParagraphBlock]
+    paragraphs: List[ParagraphBlock]          # = body_paragraphs
     intro: str
     short_conclusion: str
+    overall_tone: str = "정보형"               # 정보형 | 후기형 | 비교형
+    ending: Ending = field(default_factory=Ending)
     summary_embedding: Optional[List[float]] = None
     commercial_elements: CommercialElements = field(default_factory=CommercialElements)
     source: str = "rule"
@@ -125,14 +255,23 @@ class BlueprintResult:
     def paragraph_blueprint_json(self) -> List[dict]:
         return [p.to_dict() for p in self.paragraphs]
 
+    @property
+    def body_paragraphs(self) -> List[ParagraphBlock]:
+        """v13 spec 키 그대로 노출."""
+        return self.paragraphs
+
     def to_dict(self) -> dict:
+        """v13 spec 그대로의 JSON dict."""
         return {
-            "keyword": self.keyword,
             "title": self.title,
-            "target_reader": self.target_reader.to_dict(),
-            "paragraph_blueprint": self.paragraph_blueprint_json(),
             "intro": self.intro,
             "short_conclusion": self.short_conclusion,
+            "target_reader": self.target_reader.to_dict(),
+            "overall_tone": self.overall_tone,
+            "ending": self.ending.to_dict(),
+            "body_paragraphs": self.paragraph_blueprint_json(),
+            # OSMU 추가 메타
+            "keyword": self.keyword,
             "summary_embedding": self.summary_embedding,
             "commercial_elements": self.commercial_elements.to_dict(),
             "source": self.source,
@@ -155,34 +294,70 @@ class BlueprintResult:
 
 
 # ── 룰 모드 — domain profile 기반 폴백 ──────────────────
-_KNOWLEDGE_LEVEL_BY_INTENT = {
-    "공략": "초보",
-    "방법": "초보",
-    "팁":   "초보",
-    "추천": "중급",
-    "비교": "중급",
-    "리뷰": "중급",
-    "구매": "중급",
-    "순위": "중급",
-    "정보": "초보",
+# v13 spec 의 3종 primary_intent (정보탐색/구매결정/문제해결) 로 매핑.
+_PRIMARY_INTENT_BY_KEYWORD_INTENT = {
+    "공략": "문제해결",
+    "방법": "문제해결",
+    "팁":   "문제해결",
+    "추천": "구매결정",
+    "비교": "구매결정",
+    "리뷰": "구매결정",
+    "구매": "구매결정",
+    "순위": "구매결정",
+    "정보": "정보탐색",
+}
+_KNOWLEDGE_LEVEL_BY_KEYWORD_INTENT = {
+    "공략": "beginner",
+    "방법": "beginner",
+    "팁":   "beginner",
+    "추천": "intermediate",
+    "비교": "intermediate",
+    "리뷰": "intermediate",
+    "구매": "intermediate",
+    "순위": "intermediate",
+    "정보": "beginner",
+}
+_TONE_BY_PRIMARY_INTENT = {
+    "정보탐색": "정보형",
+    "구매결정": "비교형",
+    "문제해결": "정보형",
+}
+_ENDING_BY_PRIMARY_INTENT = {
+    "정보탐색": ("summary",        "다음에 시도할 만한 콘텐츠 안내"),
+    "구매결정": ("recommendation", "독자 상황에 맞는 1순위 추천"),
+    "문제해결": ("cta",            "구체 행동 1가지로 마무리"),
+}
+
+# 이미지 검색어 — 도메인별 기본 영문 키워드 (개별 단락에서 override 가능)
+_DEFAULT_IMG_QUERIES_BY_DOMAIN = {
+    "game":    ["video game", "gameplay screenshot", "gaming setup"],
+    "finance": ["finance chart", "investment growth", "stock market"],
+    "diet":    ["healthy meal", "fitness", "balanced diet"],
+    "it":      ["modern laptop", "tech gadget", "smartphone"],
+    "beauty":  ["skincare products", "korean beauty", "cosmetics flatlay"],
+    "travel":  ["travel landscape", "tourist landmark", "airport"],
+    "food":    ["korean food", "cooking ingredients", "homemade dish"],
+    "general": ["minimalist desk", "team collaboration", "checklist"],
 }
 
 
 def _rule_target_reader(ctx: KeywordContext) -> TargetReader:
-    """domain + intent 만으로 만드는 default 타깃 독자."""
+    """v13 spec 정렬 — knowledge_level 영문 / primary_intent 3종."""
     persona = (
         f"‘{ctx.keyword}’ 검색으로 들어온 {ctx.inferred_topic} 도메인 독자 — "
         f"의도는 ‘{ctx.intent_hint}’ 입니다."
     )
     return TargetReader(
         persona=persona,
-        knowledge_level=_KNOWLEDGE_LEVEL_BY_INTENT.get(ctx.intent_hint, "초보"),
-        primary_intent=ctx.intent_hint,
+        knowledge_level=_KNOWLEDGE_LEVEL_BY_KEYWORD_INTENT.get(
+            ctx.intent_hint, "beginner"),
+        primary_intent=_PRIMARY_INTENT_BY_KEYWORD_INTENT.get(
+            ctx.intent_hint, "정보탐색"),
     )
 
 
 def _rule_paragraphs(ctx: KeywordContext) -> List[ParagraphBlock]:
-    """domain_profile.section_titles 를 기반으로 단락 청사진을 만든다.
+    """v13 spec ParagraphBlock 그대로 채움.
 
     fact_based / llm_generated 분류 룰:
       · 1번 (도입·개요) : llm_generated
@@ -195,24 +370,45 @@ def _rule_paragraphs(ctx: KeywordContext) -> List[ParagraphBlock]:
         "2. 실제 활용 사례",
         "3. 자주 묻는 질문",
     ]
+    img_defaults = _DEFAULT_IMG_QUERIES_BY_DOMAIN.get(
+        (ctx.domain or "general").lower(),
+        _DEFAULT_IMG_QUERIES_BY_DOMAIN["general"],
+    )
     n = len(titles)
     blocks: List[ParagraphBlock] = []
     for i, t in enumerate(titles, start=1):
         if i == 1 or i == n:
             ptype = "llm_generated"
-            facts: List[str] = []
+            assigned: List[str] = []
         else:
             ptype = "fact_based"
-            facts = [ctx.keyword, ctx.intent_hint]
+            # v13 spec: assigned_keywords 는 단락 주제 분석으로 도출한 서브 키워드
+            assigned = [ctx.keyword, ctx.intent_hint]
+        # 단락별 이미지 검색어 — 룰 모드는 도메인 default 사용
+        img_query = [img_defaults[(i - 1) % len(img_defaults)]]
         blocks.append(ParagraphBlock(
-            section_index=i,
-            title=t,
-            paragraph_type=ptype,
-            description=(profile.section_requirements[i - 1]
-                          if i - 1 < len(profile.section_requirements) else ""),
-            facts_required=facts,
+            paragraph_id=f"p{i}",
+            type=ptype,
+            h2_subtitle=t,
+            core_message=(profile.section_requirements[i - 1]
+                            if i - 1 < len(profile.section_requirements) else ""),
+            assigned_keywords=assigned,
+            image_search_keywords_en=img_query,
+            image_alt_text_ko=f"{ctx.keyword} {t} 관련 이미지",
         ))
     return blocks
+
+
+def _rule_overall_tone(ctx: KeywordContext) -> str:
+    primary = _PRIMARY_INTENT_BY_KEYWORD_INTENT.get(ctx.intent_hint, "정보탐색")
+    return _TONE_BY_PRIMARY_INTENT.get(primary, "정보형")
+
+
+def _rule_ending(ctx: KeywordContext) -> Ending:
+    primary = _PRIMARY_INTENT_BY_KEYWORD_INTENT.get(ctx.intent_hint, "정보탐색")
+    end_type, direction = _ENDING_BY_PRIMARY_INTENT.get(
+        primary, ("summary", "핵심 정리"))
+    return Ending(type=end_type, direction=direction)
 
 
 def _rule_title(ctx: KeywordContext) -> str:
@@ -295,6 +491,8 @@ def _rule_blueprint(ctx: KeywordContext) -> BlueprintResult:
         title=_rule_title(ctx),
         target_reader=_rule_target_reader(ctx),
         paragraphs=_rule_paragraphs(ctx),
+        overall_tone=_rule_overall_tone(ctx),
+        ending=_rule_ending(ctx),
         commercial_elements=_rule_commercial_elements(ctx),
         intro=_rule_intro(ctx),
         short_conclusion=_rule_short_conclusion(ctx),
@@ -302,46 +500,62 @@ def _rule_blueprint(ctx: KeywordContext) -> BlueprintResult:
     )
 
 
-# ── LLM 보강 ───────────────────────────────────────────
+# ── LLM 보강 (v13 spec 정렬) ───────────────────────────
 _SYSTEM_PROMPT = """당신은 한국어 수익형 블로그의 ‘콘텐츠 설계자’ 입니다.
-주어진 KeywordContext 를 받아 collector Phase 1 산출물을 설계하세요.
+주어진 KeywordContext 를 받아 collector Phase 1 산출물을 v13 spec 형식 그대로 설계하세요.
 
 【 출력 — JSON 한 객체만, 다른 설명/코드블록 금지 】
 {
-  "title": "한 줄 글 제목 (h1, 60자 이내)",
+  "title": "h1으로 들어갈 제목",
+  "intro": "도입문 — 글에서 다룰 내용을 제시해 사용자가 계속 읽도록 유도",
+  "short_conclusion": "짧은 결론 — 답을 암시하되 본문 안 읽으면 손해라는 신호",
   "target_reader": {
-    "persona": "한 문장 페르소나",
-    "knowledge_level": "초보 | 중급 | 전문가 중 하나",
-    "primary_intent": "공략 | 추천 | 비교 | 리뷰 | 구매 | 방법 | 순위 | 팁 | 정보 중 하나"
+    "persona": "예: 홈카페 입문 1년 미만, 20-30대",
+    "knowledge_level": "beginner | intermediate | expert",
+    "primary_intent": "정보탐색 | 구매결정 | 문제해결"
   },
-  "paragraphs": [
+  "overall_tone": "정보형 | 후기형 | 비교형",
+  "ending": {
+    "type": "summary | cta | recommendation",
+    "direction": "마무리에서 유도할 행동/추천 방향"
+  },
+  "body_paragraphs": [
     {
-      "section_index": 1,
-      "title": "H2 제목",
-      "paragraph_type": "fact_based 또는 llm_generated",
-      "description": "이 단락에서 다뤄야 할 핵심을 한 줄로",
-      "facts_required": ["fact_based 일 때 검색 필요 키워드들", "..."]
+      "paragraph_id": "p1",
+      "type": "llm_generated",
+      "h2_subtitle": "단락 소제목 (h2 태그)",
+      "core_message": "이 단락이 다룰 핵심 주장/주제",
+      "assigned_keywords": ["LLM이 단락 주제 분석으로 도출한 서브 키워드"],
+      "image_search_keywords_en": ["english", "search", "terms"],
+      "image_alt_text_ko": "한국어 alt text 초안"
     },
-    ...
+    {
+      "paragraph_id": "p2",
+      "type": "fact_based",
+      "h2_subtitle": "...",
+      "core_message": "...",
+      "assigned_keywords": ["..."],
+      "image_search_keywords_en": ["..."],
+      "image_alt_text_ko": "..."
+    }
   ],
-  "intro": "글 첫 문단 한 문장 (임베딩 입력용)",
-  "short_conclusion": "글 마지막 한 문장 (임베딩 입력용)",
   "commercial_elements": {
-    "recommendations": ["글에서 추천으로 다룰 구체 항목 3~6개 (캐릭터/상품/전략 등)"],
-    "comparison_points": ["비교 단락·표에 들어갈 비교 축 3~5개"],
-    "cta_candidates": ["글에 자연스럽게 박을 CTA 문구 후보 3~5개"]
+    "recommendations": ["..."],
+    "comparison_points": ["..."],
+    "cta_candidates": ["..."]
   }
 }
 
 【 강제 룰 】
-1) paragraphs 는 4~6개. 첫 단락과 마지막 단락은 반드시 paragraph_type=llm_generated.
-2) 그 사이 단락은 가급적 fact_based — 외부 사실/수치/비교가 필요한 정보로.
-3) ‘일반 템플릿’ 금지: ‘개념’, ‘활용’, ‘결론’, ‘소개’, ‘마무리’ 같은 추상 H2 만으로 구성하면 안 됩니다.
-   각 단락 title 은 키워드의 의도(intent)를 직접 해결하는 구체 행동/요소를 담아야 합니다.
-4) target_reader.primary_intent 는 KeywordContext.intent_hint 와 동일하게.
-5) commercial_elements 의 3개 리스트는 각각 최소 2개 이상 채울 것 — 추천·비교·CTA 가 비면 글이
-   ‘만들어졌지만 돈이 안 되는’ 상태가 됩니다. 이 글의 도메인·의도에 맞는 구체 항목을 적으세요.
-6) 모든 텍스트는 한국어. 큰따옴표 안에 줄바꿈/제어문자 넣지 말 것.
+1) body_paragraphs 는 4~6개. 첫·마지막 단락은 반드시 type=llm_generated.
+2) 그 사이 단락은 type=fact_based — 외부 사실/수치/비교가 필요한 정보로.
+3) ‘일반 템플릿’ 금지: ‘개념’, ‘활용’, ‘결론’ 류 추상 h2_subtitle 만으로 구성 금지.
+   각 h2_subtitle 은 키워드의 의도를 직접 해결하는 구체 행동/요소를 담을 것.
+4) knowledge_level / primary_intent / overall_tone / ending.type 은 위 enum 중 정확히 하나.
+5) commercial_elements 3개 리스트는 각각 최소 2개 이상.
+6) fact_based 단락의 facts 배열은 비워두세요 — collector Phase 2 가 채웁니다.
+7) 모든 텍스트는 한국어 (영문 키워드 예외: image_search_keywords_en).
+8) 큰따옴표 안에 줄바꿈/제어문자 금지.
 """
 
 
@@ -407,48 +621,108 @@ def _parse_blueprint_json(text: str) -> dict:
     return json.loads(m.group(0))
 
 
-_VALID_LEVEL = {"초보", "중급", "전문가"}
-_VALID_INTENT = {"공략", "추천", "비교", "리뷰", "구매", "방법", "순위", "팁", "정보"}
-_VALID_PTYPE = {"fact_based", "llm_generated"}
+_VALID_LEVEL = set(KNOWLEDGE_LEVELS)
+_VALID_INTENT = set(PRIMARY_INTENTS)
+_VALID_TONE = set(OVERALL_TONES)
+_VALID_ENDING_TYPE = set(ENDING_TYPES)
+_VALID_PTYPE = set(PARAGRAPH_TYPES)
+
+# legacy 호환 — 이전 응답 형태(초보/공략/section_index 등)도 받아들임
+_LEGACY_LEVEL = {"초보": "beginner", "중급": "intermediate", "전문가": "expert"}
+_LEGACY_INTENT_TO_V13 = {
+    "공략": "문제해결", "방법": "문제해결", "팁": "문제해결",
+    "추천": "구매결정", "비교": "구매결정", "리뷰": "구매결정",
+    "구매": "구매결정", "순위": "구매결정",
+    "정보": "정보탐색",
+}
+
+
+def _str_list(v) -> List[str]:
+    if not v:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [str(v).strip()]
 
 
 def _normalize_blueprint_obj(obj: dict, ctx: KeywordContext) -> BlueprintResult:
-    """LLM 응답 dict → BlueprintResult. 필드 누락/잘못된 값은 raise."""
+    """LLM 응답 dict → BlueprintResult (v13 spec).
+
+    legacy 응답 형태(paragraphs/title/description 등)도 받아 v13 키로 자동 변환.
+    """
     title = (obj.get("title") or "").strip()
     if not title:
         raise ValueError("title 누락")
 
+    # ── target_reader ──
     tr = obj.get("target_reader") or {}
     persona = (tr.get("persona") or "").strip()
     level = (tr.get("knowledge_level") or "").strip()
     intent = (tr.get("primary_intent") or "").strip()
+    # legacy 한국어 → v13 영문
+    level = _LEGACY_LEVEL.get(level, level)
     if level not in _VALID_LEVEL:
-        level = _KNOWLEDGE_LEVEL_BY_INTENT.get(ctx.intent_hint, "초보")
+        level = _KNOWLEDGE_LEVEL_BY_KEYWORD_INTENT.get(ctx.intent_hint, "beginner")
+    # legacy 9종 키워드 의도 → v13 3종 행동 의도
+    intent = _LEGACY_INTENT_TO_V13.get(intent, intent)
     if intent not in _VALID_INTENT:
-        intent = ctx.intent_hint or "정보"
+        intent = _PRIMARY_INTENT_BY_KEYWORD_INTENT.get(ctx.intent_hint, "정보탐색")
     if not persona:
         persona = f"‘{ctx.keyword}’ 를 찾는 {ctx.inferred_topic} 도메인 독자"
     target = TargetReader(persona=persona, knowledge_level=level, primary_intent=intent)
 
-    raw_paragraphs = obj.get("paragraphs") or []
+    # ── overall_tone / ending ──
+    tone = (obj.get("overall_tone") or "").strip()
+    if tone not in _VALID_TONE:
+        tone = _TONE_BY_PRIMARY_INTENT.get(intent, "정보형")
+    ending_obj = obj.get("ending") or {}
+    end_type = (ending_obj.get("type") or "").strip()
+    if end_type not in _VALID_ENDING_TYPE:
+        end_type, _direction_default = _ENDING_BY_PRIMARY_INTENT.get(
+            intent, ("summary", "핵심 정리"))
+    end_direction = (ending_obj.get("direction") or "").strip() or "핵심 정리"
+    ending = Ending(type=end_type, direction=end_direction)
+
+    # ── body_paragraphs (v13 키) — paragraphs 도 후방호환 ──
+    raw_paragraphs = obj.get("body_paragraphs") or obj.get("paragraphs") or []
     if not isinstance(raw_paragraphs, list) or len(raw_paragraphs) < 3:
-        raise ValueError(f"paragraphs 부족: {len(raw_paragraphs) if isinstance(raw_paragraphs, list) else 'not_list'}")
+        raise ValueError(f"body_paragraphs 부족: {len(raw_paragraphs) if isinstance(raw_paragraphs, list) else 'not_list'}")
     paragraphs: List[ParagraphBlock] = []
     for i, p in enumerate(raw_paragraphs, start=1):
         if not isinstance(p, dict):
             continue
-        ptype = (p.get("paragraph_type") or "").strip()
+        # 필드명 v13 우선 + legacy 폴백
+        pid = (p.get("paragraph_id") or f"p{i}").strip()
+        ptype = (p.get("type") or p.get("paragraph_type") or "").strip()
         if ptype not in _VALID_PTYPE:
             ptype = "fact_based"
-        facts = p.get("facts_required") or []
-        if not isinstance(facts, list):
-            facts = [str(facts)]
+        h2 = (p.get("h2_subtitle") or p.get("title") or "").strip() or f"섹션 {i}"
+        core = (p.get("core_message") or p.get("description") or "").strip()
+        assigned = _str_list(p.get("assigned_keywords") or p.get("facts_required"))
+        img_kw = _str_list(p.get("image_search_keywords_en"))
+        img_alt = (p.get("image_alt_text_ko") or "").strip()
+        # facts — fact_based 때만, raw 응답에 들어있으면 그대로 파싱
+        facts_raw = p.get("facts") or []
+        facts: List[Fact] = []
+        if isinstance(facts_raw, list):
+            for f in facts_raw:
+                if isinstance(f, dict):
+                    facts.append(Fact(
+                        type=str(f.get("type") or "fact"),
+                        content=str(f.get("content") or "").strip(),
+                        entity=str(f.get("entity") or "").strip(),
+                        year=(int(f["year"]) if str(f.get("year") or "").isdigit() else None),
+                        source_url=str(f.get("source_url") or "").strip(),
+                    ))
         paragraphs.append(ParagraphBlock(
-            section_index=int(p.get("section_index") or i),
-            title=(p.get("title") or "").strip() or f"섹션 {i}",
-            paragraph_type=ptype,
-            description=(p.get("description") or "").strip(),
-            facts_required=[str(f).strip() for f in facts if str(f).strip()],
+            paragraph_id=pid,
+            type=ptype,
+            h2_subtitle=h2,
+            core_message=core,
+            assigned_keywords=assigned,
+            image_search_keywords_en=img_kw,
+            image_alt_text_ko=img_alt,
+            facts=facts,
         ))
     if len(paragraphs) < 3:
         raise ValueError(f"유효 paragraph 개수 부족: {len(paragraphs)}")
@@ -456,15 +730,8 @@ def _normalize_blueprint_obj(obj: dict, ctx: KeywordContext) -> BlueprintResult:
     intro = (obj.get("intro") or _rule_intro(ctx)).strip()
     conc = (obj.get("short_conclusion") or _rule_short_conclusion(ctx)).strip()
 
-    # commercial_elements — LLM 응답을 그대로 보존. 누락은 빈 상태로 두고
-    # phase1 의 auto-fix 가 룰 폴백으로 보강 (validator 가 ‘비어있음’ 을 잡아야 시그널 남음).
+    # ── commercial_elements ──
     ce_obj = obj.get("commercial_elements") or {}
-    def _str_list(v) -> List[str]:
-        if not v:
-            return []
-        if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x).strip()]
-        return [str(v).strip()]
     commercial = CommercialElements(
         recommendations=_str_list(ce_obj.get("recommendations")),
         comparison_points=_str_list(ce_obj.get("comparison_points")),
@@ -476,6 +743,8 @@ def _normalize_blueprint_obj(obj: dict, ctx: KeywordContext) -> BlueprintResult:
         title=title,
         target_reader=target,
         paragraphs=paragraphs,
+        overall_tone=tone,
+        ending=ending,
         intro=intro,
         short_conclusion=conc,
         commercial_elements=commercial,
